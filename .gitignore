@@ -1,0 +1,14 @@
+# never commit bot credentials — the token is the only secret
+.tg-bot-token
+*.token
+.env
+.env.*
+
+# local (per-machine, per-bot) config override
+config.local.json
+
+# python / uv
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

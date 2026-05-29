@@ -1,0 +1,7 @@
+{
+  "bot_slug": "",
+  "bot_username": "",
+  "mcp_name": "",
+  "group_chat_ids": [],
+  "token_env_var": "TG_BOT_TOKEN"
+}
