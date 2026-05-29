@@ -38,10 +38,10 @@ follow it.
    (no pipes, no jq) that follows the group's message file live.
 2. Run that command with **Bash `run_in_background: true`**.
 3. **Monitor** the returned process id to be notified of new messages as they land.
-4. **Filter out your own bot's messages.** Telegram echoes your bot's own sends back
-   through the poll, so the monitor will show both inbound traffic *and* your own
-   outbound. Ignore any record whose `from_user_id` is your bot's id (you can also
-   pass `from_username=` to `get_tail_command` to narrow to a sender).
+   The monitor shows only inbound messages (your own sends are not echoed back to
+   your bot and are not written to the file it follows), so you don't need to filter
+   your own traffic out. Pass `from_username=` to `get_tail_command` to narrow to a
+   specific sender if you want.
 
 You can also call `list_recent_messages()` to read recent history from the local
 store without watching live.

@@ -137,6 +137,20 @@ def main() -> int:
     else:
         print("  config.local.json: already present")
 
+    # Guard: an empty bot_slug poisons BOTH the per-slug data dir (falls back to
+    # "default") AND the derived mcp_name ("tg-local-tg"). Two unconfigured bots
+    # would then silently collide on the data store and on the ~/.claude.json MCP
+    # entry (the second register_mcp would see the name present and keep the FIRST
+    # bot's command). Refuse to register until the slug is set.
+    if not (cfg.get("bot_slug") or "").strip():
+        print()
+        print(f"  bot_slug is empty. Set it in {LOCAL_CONFIG_PATH} before continuing —")
+        print( "  it drives your data dir (~/.local/share/tg-local/<slug>/) and your")
+        print( "  MCP name (<slug>-tg). Leaving it blank would collide with any other")
+        print( "  unconfigured client on this machine. Then re-run bootstrap.")
+        print()
+        return 0
+
     status = register_mcp(mcp_name=cfg["mcp_name"], var_name=var_name)
     print(f"  MCP '{cfg['mcp_name']}' registration in {CLAUDE_CONFIG_PATH}: {status}")
 
