@@ -88,3 +88,23 @@ def test_write_local_config_creates_from_example(tmp_path, monkeypatch):
     assert json.loads(lo.read_text())["token_env_var"] == "TG_BOT_TOKEN"
     # Second call is a no-op.
     assert bootstrap.write_local_config() is False
+
+
+def test_main_refuses_to_register_with_empty_slug(tmp_path, monkeypatch, capsys):
+    """An empty bot_slug would collide on the data dir + mcp_name; bootstrap must
+    stop after config creation and tell the user to set the slug, without touching
+    ~/.claude.json."""
+    _point_config(tmp_path, monkeypatch, {"bot_slug": "", "group_chat_ids": []})
+    claude_cfg = tmp_path / ".claude.json"
+    monkeypatch.setattr(bootstrap, "CLAUDE_CONFIG_PATH", claude_cfg)
+
+    called = {"register": False}
+    monkeypatch.setattr(
+        bootstrap, "register_mcp",
+        lambda *a, **k: called.__setitem__("register", True) or "added")
+
+    rc = bootstrap.main()
+    assert rc == 0
+    assert called["register"] is False  # never registered with a blank slug
+    assert not claude_cfg.exists()
+    assert "bot_slug is empty" in capsys.readouterr().out

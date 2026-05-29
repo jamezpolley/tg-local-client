@@ -149,9 +149,11 @@ def get_tail_command(chat_id: Optional[int] = None,
     chat_id: which channel to follow (defaults to the first configured group).
     from_username / message_thread_id: optional fine-filters applied in-process.
 
-    NOTE: ignore messages from your OWN bot's from_user_id — Telegram echoes a bot's
-    own sends back through getUpdates, so a monitor without that filter sees both
-    inbound traffic and your own outbound. Filter them out client-side.
+    The monitor only ever shows INBOUND messages: the per-channel JSONL this command
+    follows is written only on inbound (the Bot API does not deliver a bot's own sends
+    back to it, and outbound is recorded to SQLite only, never to the JSONL). So you
+    do not need to filter out your own sends here. Use from_username to narrow to a
+    specific sender if you want.
 
     Returns {command, jsonl_path}.
     """
