@@ -336,7 +336,9 @@ def test_get_tail_command_filter_sanitised(monkeypatch):
     assert ";" not in out["command"]
 
 
-def test_get_tail_command_raises_when_no_group(monkeypatch):
+def test_get_tail_command_raises_when_no_group_and_no_known_chats(monkeypatch, tmp_path):
+    """When the DB has no messages AND config has no group_chat_ids, raise."""
+    _reload_data_dir(tmp_path, monkeypatch)
     monkeypatch.setattr(mcp_server, "_config", {"group_chat_ids": []})
     fn = _unwrap(mcp_server.get_tail_command)
     with pytest.raises(RuntimeError, match="group_chat_ids"):
@@ -477,3 +479,120 @@ def test_download_media_no_media_field(monkeypatch, tmp_path):
     fn = _unwrap(mcp_server.download_media)
     with pytest.raises(ValueError, match="no media"):
         asyncio.run(fn(message_id=1))
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: drift-proof all-membership tail — live-derive channels from DB
+# ---------------------------------------------------------------------------
+
+def test_get_tail_command_no_args_uses_all_known_chats(monkeypatch, tmp_path):
+    """With no chat_id / channels args, tail command covers ALL chats in the DB,
+    not just group_chat_ids[0]."""
+    _reload_data_dir(tmp_path, monkeypatch)
+    monkeypatch.setattr(mcp_server, "_config", {"group_chat_ids": [-100999]})
+
+    # Seed the DB with messages from a DM chat not in the static config.
+    conn = db.connect()
+    conn.execute("INSERT INTO messages (telegram_msg_id, chat_id, text, ts, direction) "
+                 "VALUES (1, -100999, 'group msg', 1, 'in')")
+    conn.execute("INSERT INTO messages (telegram_msg_id, chat_id, text, ts, direction) "
+                 "VALUES (2, 174969502, 'dm msg', 2, 'in')")  # DM not in config
+    conn.close()
+
+    fn = _unwrap(mcp_server.get_tail_command)
+    out = fn()
+    cmd = out["command"]
+
+    # Both channels appear in the tail command.
+    assert "-100999.jsonl" in cmd
+    assert "174969502.jsonl" in cmd
+    assert len(out["jsonl_paths"]) == 2
+
+
+def test_get_tail_command_no_args_falls_back_to_config_seed_when_db_empty(monkeypatch, tmp_path):
+    """When the DB is empty (fresh install), fall back to group_chat_ids seed."""
+    _reload_data_dir(tmp_path, monkeypatch)
+    monkeypatch.setattr(mcp_server, "_config", {"group_chat_ids": [-100999]})
+
+    # DB is empty — no messages yet.
+    db.connect().close()
+
+    fn = _unwrap(mcp_server.get_tail_command)
+    out = fn()
+    cmd = out["command"]
+
+    # Falls back to the configured group.
+    assert "-100999.jsonl" in cmd
+    assert len(out["jsonl_paths"]) == 1
+
+
+def test_get_tail_command_new_dm_picked_up_on_next_call(monkeypatch, tmp_path):
+    """A new DM arriving after a session started is included on the NEXT call to
+    get_tail_command with no args (because all_known_chat_ids re-queries the DB)."""
+    _reload_data_dir(tmp_path, monkeypatch)
+    monkeypatch.setattr(mcp_server, "_config", {"group_chat_ids": [-100999]})
+
+    conn = db.connect()
+    conn.execute("INSERT INTO messages (telegram_msg_id, chat_id, text, ts, direction) "
+                 "VALUES (1, -100999, 'hi', 1, 'in')")
+    conn.close()
+
+    fn = _unwrap(mcp_server.get_tail_command)
+    out1 = fn()
+    assert len(out1["jsonl_paths"]) == 1
+
+    # New DM arrives — recorded in DB.
+    conn = db.connect()
+    conn.execute("INSERT INTO messages (telegram_msg_id, chat_id, text, ts, direction) "
+                 "VALUES (2, 999888777, 'new dm', 2, 'in')")
+    conn.close()
+
+    out2 = fn()
+    assert len(out2["jsonl_paths"]) == 2
+    paths_str = " ".join(out2["jsonl_paths"])
+    assert "999888777.jsonl" in paths_str
+
+
+def test_all_known_chat_ids_db_helper(monkeypatch, tmp_path):
+    """all_known_chat_ids() returns all distinct chat_ids from the messages table."""
+    _reload_data_dir(tmp_path, monkeypatch)
+
+    conn = db.connect()
+    conn.execute("INSERT INTO messages (telegram_msg_id, chat_id, text, ts, direction) "
+                 "VALUES (1, -100, 'a', 1, 'in')")
+    conn.execute("INSERT INTO messages (telegram_msg_id, chat_id, text, ts, direction) "
+                 "VALUES (2, 42, 'b', 2, 'in')")
+    conn.execute("INSERT INTO messages (telegram_msg_id, chat_id, text, ts, direction) "
+                 "VALUES (3, -100, 'c', 3, 'out')")  # duplicate chat_id
+    conn.close()
+
+    ids = db.all_known_chat_ids()
+    assert set(ids) == {-100, 42}  # distinct; duplicate deduplicated
+
+
+def test_channel_topics_negative_id_uses_equals_form(monkeypatch):
+    """--channel-topics for negative chat_ids uses the = form to avoid argparse
+    treating the negative value as an option flag."""
+    monkeypatch.setattr(mcp_server, "_config", {"group_chat_ids": [-100999]})
+    fn = _unwrap(mcp_server.get_tail_command)
+    out = fn(channels=[
+        {"chat_id": -1003730692254, "topics": "general"},
+    ])
+    cmd = out["command"]
+    # Must be the = form; the space form would fail argparse.
+    assert "--channel-topics=-1003730692254:general" in cmd
+    assert "--channel-topics -1003730692254" not in cmd
+
+
+def test_chat_id_from_path_handles_bot_keyed_filename():
+    """chat_id_from_path extracts the chat_id from bot-keyed filenames like
+    <chat_id>__<bot_slug>.jsonl — used when bot-keyed DM files are tailed."""
+    import tg_local_client.tail as tail
+
+    assert tail.chat_id_from_path("/data/channels/174969502__glen.jsonl") == 174969502
+    assert tail.chat_id_from_path("/data/channels/174969502__brass-otter.jsonl") == 174969502
+    # Plain scheme still works.
+    assert tail.chat_id_from_path("/data/channels/-1003730692254.jsonl") == -1003730692254
+    assert tail.chat_id_from_path("/data/channels/42.jsonl") == 42
+    # Non-integer stem → None.
+    assert tail.chat_id_from_path("/data/channels/channels") is None

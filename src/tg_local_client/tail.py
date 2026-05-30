@@ -85,13 +85,20 @@ TopicSpec = Union[None, str, list]
 
 
 def chat_id_from_path(path: Union[str, Path]) -> Optional[int]:
-    """Derive the channel chat_id from a per-channel JSONL filename (<chat_id>.jsonl).
+    """Derive the channel chat_id from a per-channel JSONL filename.
 
-    Returns None if the stem isn't a plain integer (e.g. a non-standard path),
-    in which case per-channel topic specs can't be keyed to this file and the
-    global default applies.
+    Handles two naming schemes:
+      - Plain: <chat_id>.jsonl                (groups, legacy DMs)
+      - Bot-keyed: <chat_id>__<bot_slug>.jsonl (private DMs, multi-bot safety)
+
+    Returns the integer chat_id, or None if the stem can't be parsed (e.g. a
+    non-standard path), in which case per-channel topic specs can't be keyed to
+    this file and the global default applies.
     """
     stem = Path(path).stem
+    # Bot-keyed form: <chat_id>__<slug>
+    if "__" in stem:
+        stem = stem.split("__", 1)[0]
     try:
         return int(stem)
     except (TypeError, ValueError):

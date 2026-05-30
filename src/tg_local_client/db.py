@@ -39,12 +39,53 @@ DB_PATH = DATA_DIR / "messages.db"
 MEDIA_DIR = DATA_DIR / "media"
 
 
-def channel_jsonl_path(chat_id: int) -> Path:
-    """Per-channel JSONL file path for a chat_id (created lazily). One file per
-    channel — a DM is just a chat with its own chat_id, handled uniformly."""
-    p = DATA_DIR / "channels" / f"{chat_id}.jsonl"
+def is_private_chat(chat_id: int) -> bool:
+    """True when chat_id is a private (user) DM — positive ids.
+
+    Telegram assigns positive ids to users and negative ids to groups/supergroups/
+    channels. In a single-bot-per-datadir deployment (the common local-client case)
+    the private-vs-group distinction is mainly for consistency with the fabric's
+    bot-keyed scheme. The caller supplies bot_slug so two bots sharing a data dir
+    would still get separate DM files.
+    """
+    return chat_id > 0
+
+
+def channel_jsonl_path(chat_id: int, bot_slug: Optional[str] = None) -> Path:
+    """Per-channel JSONL file path for a chat_id (created lazily).
+
+    PRIVATE CHATS (positive chat_id): when bot_slug is given, the file is
+    bot-keyed: channels/<chat_id>__<bot_slug>.jsonl.  This mirrors the fabric's
+    scheme so two local-client bots sharing a data dir don't bleed DMs.  When
+    bot_slug is None (legacy callers, single-bot reality) the old flat path is
+    returned for backward compatibility.
+
+    GROUP / SUPERGROUP / CHANNEL (negative chat_id): shared flat scheme unchanged —
+    channels/<chat_id>.jsonl.
+    """
+    if is_private_chat(chat_id) and bot_slug:
+        p = DATA_DIR / "channels" / f"{chat_id}__{bot_slug}.jsonl"
+    else:
+        p = DATA_DIR / "channels" / f"{chat_id}.jsonl"
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def all_known_chat_ids() -> list[int]:
+    """Return all chat_ids seen in the local store (from the messages table).
+
+    Used by get_tail_command() with no channel args to live-derive the full set
+    of channels rather than relying on the static group_chat_ids config seed.
+    Returns a de-duplicated list in no guaranteed order.
+    """
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT chat_id FROM messages"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [row[0] for row in rows]
 
 
 SCHEMA = """
@@ -118,9 +159,14 @@ def now_ts() -> int:
     return int(time.time())
 
 
-def write_channel_line(record: dict) -> None:
-    """Append one record as a compact JSON line to its per-channel file."""
-    ch_path = channel_jsonl_path(record["chat_id"])
+def write_channel_line(record: dict, bot_slug: Optional[str] = None) -> None:
+    """Append one record as a compact JSON line to its per-channel file.
+
+    bot_slug: when provided, private-chat files are bot-keyed
+    (channels/<chat_id>__<bot_slug>.jsonl) to avoid cross-bot DM bleed.
+    Group files are always the shared flat scheme.
+    """
+    ch_path = channel_jsonl_path(record["chat_id"], bot_slug)
     with ch_path.open("a") as f:
         f.write(json.dumps(record) + "\n")
         f.flush()
