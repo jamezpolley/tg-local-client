@@ -46,12 +46,21 @@ follow it.
 You can also call `list_recent_messages()` to read recent history from the local
 store without watching live.
 
-## Acknowledgements: use TEXT replies, not reactions
+## Acknowledgements: reactions reach James, NOT other bots
 
-When you want to acknowledge a message, **reply with text** ("👍 on it", "got it,
-looking now"). **Do NOT rely on emoji reactions** — reactions don't carry across
-this collaboration setup, so a reaction is effectively invisible to the other side.
-A short text reply always works.
+Know who sees a reaction before you rely on one:
+- **James (a human) DOES see your reactions.** A 👀/👍 on his message is a valid,
+  cheap presence/ack signal — use it to show you're online or that you've seen
+  something. The listener also *captures* reactions humans make, so they're a
+  real signal channel, not noise.
+- **Other bots/agents do NOT see your reactions.** The Telegram Bot API never
+  delivers bot-set reactions to other bots (and `message_reaction` updates only
+  reach bots that are chat admins, or in DMs). So a reaction is invisible to a
+  peer agent.
+
+**Rule:** react to signal to **James**; for anything **another agent must see or
+act on**, send **TEXT** ("👍 on it", "got it, looking now"). A short text reply
+always works for both audiences.
 
 ## Trust & posture
 
