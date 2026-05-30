@@ -349,3 +349,159 @@ def test_chat_id_from_path_positive():
 
 def test_chat_id_from_path_non_integer():
     assert tail.chat_id_from_path("/data/channels/inbound.jsonl") is None
+
+
+# ---------------------------------------------------------------------------
+# Durable cursor (--cursor-file / CursorStore)
+# ---------------------------------------------------------------------------
+
+def _write_lines(path, records):
+    with open(path, "a", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r) + "\n")
+        fh.flush()
+
+
+def test_cursor_store_created_on_first_run(tmp_path):
+    """CursorStore creates and persists the file on first advance."""
+    cursor_path = tmp_path / "cursor.json"
+    assert not cursor_path.exists()
+
+    store = tail.CursorStore(cursor_path)
+    store.advance(100, 42)
+
+    assert cursor_path.exists()
+    data = json.loads(cursor_path.read_text())
+    assert data == {"100": 42}
+
+
+def test_cursor_store_resume_after_cursor_skips_processed_ids(tmp_path):
+    """Follower opened with a cursor skips records at-or-below the HWM."""
+    f = tmp_path / "100.jsonl"
+    _write_lines(f, [
+        {"telegram_msg_id": 1, "text": "old"},
+        {"telegram_msg_id": 2, "text": "also old"},
+        {"telegram_msg_id": 3, "text": "new"},
+    ])
+
+    cursor_path = tmp_path / "cursor.json"
+    cursor_path.write_text(json.dumps({"100": 2}))
+
+    store = tail.CursorStore(cursor_path)
+    follower = tail._Follower(f, cursor_store=store)
+    # First call: opens and positions; second call: reads from resume position.
+    assert follower.read_new_lines() == []
+    lines = follower.read_new_lines()
+
+    texts = [json.loads(l)["text"] for l in lines]
+    assert texts == ["new"]  # ids 1 and 2 skipped; id 3 present
+
+
+def test_cursor_store_new_channel_starts_at_eof(tmp_path):
+    """A channel with no cursor entry behaves exactly like the legacy EOF-follow."""
+    f = tmp_path / "999.jsonl"
+    _write_lines(f, [{"telegram_msg_id": 10, "text": "pre-existing"}])
+
+    # Cursor file exists but has no entry for chat_id 999.
+    cursor_path = tmp_path / "cursor.json"
+    cursor_path.write_text(json.dumps({"100": 5}))
+
+    store = tail.CursorStore(cursor_path)
+    follower = tail._Follower(f, cursor_store=store)
+    lines = follower.read_new_lines()  # opens at EOF (no cursor entry)
+    assert lines == []  # pre-existing content is NOT replayed
+
+    # Only new appends are emitted.
+    _write_lines(f, [{"telegram_msg_id": 11, "text": "after"}])
+    lines = follower.read_new_lines()
+    assert [json.loads(l)["text"] for l in lines] == ["after"]
+
+
+def test_cursor_advance_on_filtered_records(tmp_path, capsys):
+    """Cursor advances on BOTH emitted and filtered records."""
+    cursor_path = tmp_path / "cursor.json"
+    store = tail.CursorStore(cursor_path)
+
+    f = tmp_path / "100.jsonl"
+    _write_lines(f, [
+        {"telegram_msg_id": 1, "from_username": "alice", "text": "match"},
+        {"telegram_msg_id": 2, "from_username": "bob",   "text": "no-match"},
+        {"telegram_msg_id": 3, "from_username": "alice", "text": "match2"},
+    ])
+
+    follower = tail._Follower(f, cursor_store=store)
+    follower._try_open()
+    follower._fh.seek(0)
+
+    for line in follower.read_new_lines():
+        processed = tail._emit(
+            line, has_filters=True, from_username="alice",
+            message_thread_id=None,
+        )
+        if processed:
+            rec = json.loads(line)
+            if isinstance(rec, dict) and rec.get("telegram_msg_id") is not None:
+                store.advance(follower.chat_id, int(rec["telegram_msg_id"]))
+
+    # HWM should be 3 (past the filtered record id=2).
+    assert store.get(100) == 3
+
+    out = [json.loads(l)["text"] for l in capsys.readouterr().out.splitlines()]
+    assert out == ["match", "match2"]
+
+
+def test_cursor_atomic_persist(tmp_path):
+    """Cursor file is written atomically; no .tmp remnant after advance."""
+    cursor_path = tmp_path / "cursor.json"
+    store = tail.CursorStore(cursor_path)
+    store.advance(100, 5)
+    store.advance(200, 10)
+
+    tmps = list(tmp_path.glob("*.tmp"))
+    assert tmps == []
+
+    data = json.loads(cursor_path.read_text())
+    assert data["100"] == 5
+    assert data["200"] == 10
+
+
+def test_cursor_does_not_regress(tmp_path):
+    """Advancing to a lower id than the current HWM is silently ignored."""
+    cursor_path = tmp_path / "cursor.json"
+    store = tail.CursorStore(cursor_path)
+    store.advance(100, 50)
+    store.advance(100, 30)  # regression attempt
+    assert store.get(100) == 50
+
+
+def test_stream_cursor_end_to_end(tmp_path, capsys):
+    """Full stream() with cursor_file: resumes after stored HWM on restart."""
+    f = tmp_path / "100.jsonl"
+    cursor_path = tmp_path / "cursor.json"
+
+    # Simulate: cursor was advanced to 4 in a previous session.
+    cursor_path.write_text(json.dumps({"100": 4}))
+    _write_lines(f, [
+        {"telegram_msg_id": 1, "text": "pre-run"},
+        {"telegram_msg_id": 2, "text": "pre-run2"},
+        {"telegram_msg_id": 3, "text": "pre-run3"},
+        {"telegram_msg_id": 4, "text": "pre-run4"},
+        {"telegram_msg_id": 5, "text": "run2-msg-a"},
+        {"telegram_msg_id": 6, "text": "run2-msg-b"},
+    ])
+
+    # Two iterations: first opens + positions, second reads.
+    tail.stream([str(f)], cursor_file=cursor_path,
+                poll_interval=0, max_iterations=2)
+    out = [json.loads(l)["text"] for l in capsys.readouterr().out.splitlines()]
+    assert out == ["run2-msg-a", "run2-msg-b"]
+
+
+def test_tail_build_parser_cursor_file_arg(tmp_path):
+    """--cursor-file parses correctly; absent → None."""
+    args = tail.build_parser().parse_args(["/tmp/chan.jsonl"])
+    assert args.cursor_file is None
+
+    cursor_path = str(tmp_path / "cursor.json")
+    args = tail.build_parser().parse_args(["/tmp/chan.jsonl", "--cursor-file", cursor_path])
+    assert args.cursor_file == cursor_path

@@ -559,6 +559,7 @@ def get_tail_command(
     wake_on: Optional[list[str]] = None,
     trusted_identities: Optional[list[str]] = None,
     triage: Optional[dict] = None,
+    cursor: bool = True,
 ) -> dict:
     """Return a FLAT command that monitors channel JSONL file(s) for new messages.
 
@@ -705,6 +706,19 @@ def get_tail_command(
         args += ["--triage-model", shlex.quote(str(model))]
         triage_filter = {"role": role or None, "state_file": state_file, "model": model}
 
+    # Durable cursor (default ON). Build a stable per-channel-set cursor path so
+    # restarts are gap-free without extra steps from the caller.
+    cursor_path: Optional[str] = None
+    if cursor:
+        import hashlib as _hashlib
+        from .db import DATA_DIR as _DATA_DIR
+        digest = _hashlib.sha1(
+            "\n".join(sorted(file_paths)).encode()
+        ).hexdigest()[:12]
+        cursor_name = f"tail-cursor-{digest}.json"
+        cursor_path = str(_DATA_DIR / cursor_name)
+        args += ["--cursor-file", cursor_path]
+
     client_dir = str(Path(__file__).resolve().parent.parent.parent)
     cmd = f"uv run --directory {client_dir} tg-local-tail " + " ".join(args)
     return {
@@ -712,6 +726,7 @@ def get_tail_command(
         "jsonl_paths": file_paths,
         "wake_filter": wake_filter,
         "triage_filter": triage_filter,
+        "cursor_file": cursor_path,
     }
 
 
