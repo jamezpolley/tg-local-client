@@ -40,12 +40,34 @@ relevance triage stays a separate later layer the agent owns.
   --triage-role            agent identity string
   --triage-state-file      path to agent's waiting-on state file
   --triage-model           claude model alias (default: haiku)
+
+## Durable-consumer cursor (`--cursor-file`)
+
+When `--cursor-file PATH` is given the tail maintains a persisted high-water mark:
+a small JSON file mapping `chat_id -> last_processed_telegram_msg_id`.  On
+startup each follower resumes AFTER its stored cursor (skipping already-processed
+records) rather than blindly starting from EOF.  This closes the silent-drop gap
+that exists when a monitor restarts: any messages that arrived during the downtime
+are replayed automatically, exactly once.
+
+Key semantics:
+- **First encounter (no cursor entry for a channel):** start from EOF — identical
+  to the legacy behaviour; do NOT replay history.
+- **Cursor advance:** the cursor is advanced past every PROCESSED record (whether
+  it was emitted/ACT or filtered/SKIP/triage-SKIP).  Skipped records won't be
+  re-read on the next restart.
+- **At-least-once delivery:** the cursor is persisted atomically AFTER
+  stdout.flush() so a crash between emit and persist will re-emit at most the last
+  record — a harmless duplicate wakeup rather than a silent skip.
+- **Backward compatibility:** when `--cursor-file` is absent, behaviour is entirely
+  unchanged (EOF-follow, no state file).
 """
 import argparse
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional, Union
@@ -121,22 +143,129 @@ def _is_trusted_human(record: dict, trusted_ids: Optional[list]) -> bool:
     return record.get("from_user_id") in trusted_ids
 
 
+# ---------------------------------------------------------------------------
+# Durable cursor store
+# ---------------------------------------------------------------------------
+
+class CursorStore:
+    """Persisted high-water mark: {str(chat_id): last_processed_telegram_msg_id}.
+
+    The file is a flat JSON object written atomically (write-temp-then-rename) so
+    a crash mid-write leaves the previous version intact.
+
+    Format on disk:
+        {"100": 4217, "-1003730692254": 1088, ...}
+
+    Keys are string-coerced chat_ids; values are integer telegram_msg_ids
+    representing the last PROCESSED record (whether emitted or filtered/skipped).
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._data: dict[str, int] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                self._data = {str(k): int(v) for k, v in loaded.items()
+                              if isinstance(v, (int, float)) and v == int(v)}
+        except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+            self._data = {}
+
+    def get(self, chat_id: Optional[int]) -> Optional[int]:
+        """Return the stored HWM for chat_id, or None if unknown."""
+        if chat_id is None:
+            return None
+        return self._data.get(str(chat_id))
+
+    def advance(self, chat_id: Optional[int], telegram_msg_id: int) -> None:
+        """Advance the HWM for chat_id to telegram_msg_id and persist atomically.
+
+        Only advances (never regresses); silently ignores if telegram_msg_id is
+        not greater than the current HWM.
+        """
+        if chat_id is None:
+            return
+        key = str(chat_id)
+        current = self._data.get(key)
+        if current is not None and telegram_msg_id <= current:
+            return
+        self._data[key] = telegram_msg_id
+        self._persist()
+
+    def _persist(self) -> None:
+        """Write the cursor file atomically via a temp-file rename."""
+        parent = self._path.parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(self._data, fh, separators=(",", ":"))
+                os.replace(tmp, self._path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            pass  # best-effort; the next successful advance will retry
+
+
+# ---------------------------------------------------------------------------
+# File follower
+# ---------------------------------------------------------------------------
+
 class _Follower:
     """Tracks one file: open handle, inode, and position, with rotation handling."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, cursor_store: Optional["CursorStore"] = None) -> None:
         self.path = path
         self.chat_id = chat_id_from_path(path)
         self._fh = None
         self._inode = None
+        self._cursor_store = cursor_store
+        self._positioned = False
 
     def _try_open(self) -> None:
         try:
             fh = open(self.path, "r", encoding="utf-8", errors="replace")
         except (FileNotFoundError, IsADirectoryError, PermissionError):
             return
-        # Seek to end: -n0 means we only emit lines appended AFTER we start.
-        fh.seek(0, os.SEEK_END)
+
+        if not self._positioned:
+            self._positioned = True
+            hwm = self._cursor_store.get(self.chat_id) if self._cursor_store else None
+            if hwm is None:
+                # No cursor entry: start from EOF (-n0 behaviour).
+                fh.seek(0, os.SEEK_END)
+            else:
+                # Cursor present: scan to find byte position of first record > HWM.
+                fh.seek(0)
+                resume_pos = 0
+                while True:
+                    line = fh.readline()
+                    if not line:
+                        break
+                    if not line.endswith("\n"):
+                        fh.seek(fh.tell() - len(line))
+                        break
+                    try:
+                        rec = json.loads(line)
+                        if isinstance(rec, dict):
+                            mid = rec.get("telegram_msg_id")
+                            if mid is not None and int(mid) <= hwm:
+                                resume_pos = fh.tell()
+                    except (json.JSONDecodeError, ValueError):
+                        resume_pos = fh.tell()
+                fh.seek(resume_pos)
+        # Rotation/truncation recovery: re-opened from BOF; HWM filter in stream()
+        # guards against re-emitting already-seen records.
+
         try:
             self._inode = os.fstat(fh.fileno()).st_ino
         except OSError:
@@ -268,8 +397,12 @@ def _emit(line: str, *, has_filters: bool, from_username: Optional[str],
           wake_on: Optional[list[str]] = None,
           mention_username: Optional[str] = None,
           trusted_user_ids: Optional[list[int]] = None,
-          triage_config=None) -> None:
+          triage_config=None) -> bool:
     """Apply filters to one raw JSONL line and print it (compact) if it matches.
+
+    Returns True if the record was processed (whether emitted or filtered/skipped),
+    False only if the line could not be parsed into a dict.  The cursor should be
+    advanced on every True return.
 
     The deterministic filters are the free coarse cut. When `triage_config` is set
     (opt-in --triage), a line that survives them then goes through the Haiku
@@ -281,18 +414,18 @@ def _emit(line: str, *, has_filters: bool, from_username: Optional[str],
         if triage_config is None:
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
-            return
+            return True
         # Triage-only mode: classify, emit verbatim if ACT.
         if _triage_passes(line, triage_config):
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
-        return
+        return True
     try:
         record = json.loads(line)
     except (json.JSONDecodeError, ValueError):
-        return  # filters active → can't match an unparseable line; drop it
+        return False  # filters active → can't match an unparseable line; drop it
     if not isinstance(record, dict):
-        return
+        return False
     if _matches(record, from_username=from_username,
                 message_thread_id=message_thread_id,
                 exclude_from_user_id=exclude_from_user_id,
@@ -301,10 +434,12 @@ def _emit(line: str, *, has_filters: bool, from_username: Optional[str],
                 mention_username=mention_username,
                 trusted_user_ids=trusted_user_ids):
         # Deterministic layer passed; now the opt-in smart residue cut.
-        if not _triage_passes(line, triage_config):
-            return
-        sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
-        sys.stdout.flush()
+        if _triage_passes(line, triage_config):
+            sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+        return True
+    # Filtered out by deterministic layer; advance cursor anyway.
+    return True
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -354,6 +489,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "fed into the Haiku prompt.")
     p.add_argument("--triage-model", default=_triage_mod.DEFAULT_TRIAGE_MODEL,
                    help="claude model alias for the relevance call (default: haiku).")
+    # Durable cursor.
+    p.add_argument("--cursor-file", default=None,
+                   help="path to a JSON cursor file that persists per-channel "
+                        "high-water marks (chat_id → last_processed_telegram_msg_id). "
+                        "When set the tail resumes exactly where it left off after a "
+                        "restart, closing the silent-drop gap. "
+                        "First encounter of a channel starts from EOF (legacy). "
+                        "The cursor is advanced on every processed record (emitted OR "
+                        "filtered/skipped). Written atomically. "
+                        "When absent behaviour is UNCHANGED (EOF-follow, no state).")
     return p
 
 
@@ -393,6 +538,7 @@ def stream(files: list[str], *, from_username: Optional[str] = None,
            mention_username: Optional[str] = None,
            trusted_user_ids: Optional[list[int]] = None,
            triage_config=None,
+           cursor_file: Optional[Path] = None,
            poll_interval: float = POLL_INTERVAL,
            max_iterations: Optional[int] = None) -> None:
     """Follow the given files forever, emitting new matching lines to stdout.
@@ -406,6 +552,12 @@ def stream(files: list[str], *, from_username: Optional[str] = None,
     triage_config: opt-in triage.TriageConfig enabling the Haiku ACT/SKIP smart
         residue cut on lines that survive the deterministic filters. None = off
         (behaviour byte-identical to the deterministic-only path).
+    cursor_file: optional Path to a durable JSON cursor file.  When set, each
+        channel resumes after its stored HWM rather than starting from EOF,
+        closing the message-gap that occurs on monitor restarts.  The cursor is
+        advanced on every processed record (emitted OR filtered/skipped).  First
+        encounter of a channel (no entry in cursor_file) starts from EOF.  When
+        None, behaviour is UNCHANGED (backward compatible).
 
     max_iterations bounds the poll loop (used by tests); None = run until killed.
     """
@@ -414,22 +566,51 @@ def stream(files: list[str], *, from_username: Optional[str] = None,
         or bool(exclude_from_user_id) \
         or bool(channel_topics) \
         or bool(wake_on)
-    followers = [_Follower(Path(f)) for f in files]
+
+    cursor_store: Optional[CursorStore] = None
+    if cursor_file is not None:
+        cursor_store = CursorStore(Path(cursor_file))
+
+    followers = [_Follower(Path(f), cursor_store=cursor_store) for f in files]
     iterations = 0
     try:
         while True:
             for follower in followers:
                 topic_spec = channel_topics.get(follower.chat_id)
                 for line in follower.read_new_lines():
-                    _emit(line, has_filters=has_filters,
-                          from_username=from_username,
-                          message_thread_id=message_thread_id,
-                          exclude_from_user_id=exclude_from_user_id,
-                          topic_spec=topic_spec,
-                          wake_on=wake_on,
-                          mention_username=mention_username,
-                          trusted_user_ids=trusted_user_ids,
-                          triage_config=triage_config)
+                    # Secondary HWM filter: guards against re-emitting records after
+                    # rotation/truncation recovery (which re-reads from BOF).
+                    if cursor_store is not None and follower.chat_id is not None:
+                        hwm = cursor_store.get(follower.chat_id)
+                        if hwm is not None:
+                            try:
+                                rec = json.loads(line)
+                                mid = rec.get("telegram_msg_id") if isinstance(rec, dict) else None
+                                if mid is not None and int(mid) <= hwm:
+                                    continue
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+
+                    processed = _emit(line, has_filters=has_filters,
+                                      from_username=from_username,
+                                      message_thread_id=message_thread_id,
+                                      exclude_from_user_id=exclude_from_user_id,
+                                      topic_spec=topic_spec,
+                                      wake_on=wake_on,
+                                      mention_username=mention_username,
+                                      trusted_user_ids=trusted_user_ids,
+                                      triage_config=triage_config)
+
+                    if processed and cursor_store is not None and follower.chat_id is not None:
+                        try:
+                            rec = json.loads(line)
+                            if isinstance(rec, dict):
+                                mid = rec.get("telegram_msg_id")
+                                if mid is not None:
+                                    cursor_store.advance(follower.chat_id, int(mid))
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+
             iterations += 1
             if max_iterations is not None and iterations >= max_iterations:
                 return
@@ -443,6 +624,7 @@ def stream(files: list[str], *, from_username: Optional[str] = None,
 
 def run(argv: Optional[list[str]] = None) -> None:
     args = build_parser().parse_args(argv)
+    cursor_file = Path(args.cursor_file) if args.cursor_file else None
     stream(
         args.files,
         from_username=args.from_username,
@@ -453,6 +635,7 @@ def run(argv: Optional[list[str]] = None) -> None:
         mention_username=args.mention_username,
         trusted_user_ids=args.trusted_user_id,
         triage_config=_build_triage_config(args),
+        cursor_file=cursor_file,
     )
 
 
