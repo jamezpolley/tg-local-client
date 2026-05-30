@@ -8,6 +8,7 @@ fabric.
 This module exposes:
   * build_inbound_record(msg) — pure function, builds the JSONL/DB record (tested).
   * persist_inbound(record)   — write to SQLite + per-channel JSONL, dedup-safe.
+  * record_outbound(...)      — persist an outbound message to SQLite.
   * make_bot(token)           — construct the aiogram Bot.
   * poll(bot)                 — run the dispatcher; called from a background task.
 """
@@ -17,7 +18,7 @@ from typing import Optional
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 
-from .db import connect, now_ts, write_channel_line
+from .db import connect, now_ts, note_chat, write_channel_line
 
 log = logging.getLogger("tg-local-listener")
 
@@ -49,14 +50,39 @@ def _media_info(msg: Message) -> dict:
             "media_file_size": None, "media_mime_type": None}
 
 
+def _chat_display_name(chat) -> str:
+    """Compute a human-readable name for a Telegram chat.
+
+    Groups/supergroups/channels carry a `.title`. Private DMs carry
+    `.first_name`/`.last_name`/`.username` instead. Falls back through:
+    title → "first last" → "@username" → str(chat_id).
+    """
+    title = getattr(chat, "title", None)
+    if title:
+        return title
+    first = getattr(chat, "first_name", None)
+    last = getattr(chat, "last_name", None)
+    name = " ".join(p for p in (first, last) if p).strip()
+    if name:
+        return name
+    username = getattr(chat, "username", None)
+    if username:
+        return f"@{username}"
+    return str(getattr(chat, "id", ""))
+
+
 def build_inbound_record(msg: Message) -> dict:
     """Build the inbound record dict from an aiogram Message.
 
     `ts` uses the message's own send time when available (msg.date), falling back
     to now — so the stored timestamp is authoritative, not processing time.
+
+    `reply_to_telegram_msg_id` is set when the message is a reply to another
+    message, so the monitoring agent can thread correctly.
     """
     text = msg.text or msg.caption or ""
     ts = int(msg.date.timestamp()) if getattr(msg, "date", None) else now_ts()
+    reply_to = getattr(msg, "reply_to_message", None)
     record = {
         "telegram_msg_id": msg.message_id,
         "chat_id": msg.chat.id,
@@ -66,6 +92,7 @@ def build_inbound_record(msg: Message) -> dict:
         "text": text,
         "ts": ts,
         "message_thread_id": getattr(msg, "message_thread_id", None),
+        "reply_to_telegram_msg_id": reply_to.message_id if reply_to else None,
         **_media_info(msg),
     }
     return record
@@ -82,11 +109,13 @@ def persist_inbound(record: dict) -> Optional[int]:
                (telegram_msg_id, chat_id, from_user_id, from_username,
                 from_first_name, text, ts, direction,
                 media_type, media_file_id, media_file_unique_id,
-                media_mime_type, media_file_size, message_thread_id)
+                media_mime_type, media_file_size, message_thread_id,
+                reply_to_telegram_msg_id)
                VALUES (:telegram_msg_id, :chat_id, :from_user_id, :from_username,
                        :from_first_name, :text, :ts, 'in',
                        :media_type, :media_file_id, :media_file_unique_id,
-                       :media_mime_type, :media_file_size, :message_thread_id)""",
+                       :media_mime_type, :media_file_size, :message_thread_id,
+                       :reply_to_telegram_msg_id)""",
             record,
         )
         if not cur.rowcount:
@@ -125,7 +154,16 @@ def build_dispatcher() -> Dispatcher:
 
     @dp.message()
     async def on_message(msg: Message) -> None:  # noqa: ANN202
-        persist_inbound(build_inbound_record(msg))
+        record = build_inbound_record(msg)
+        persist_inbound(record)
+        # Record the chat's human-readable name + type so list_known_chats can
+        # surface it without a side-channel lookup. Runs on every capture (titles
+        # can change over time). Best-effort — never raises into the poller.
+        try:
+            note_chat(msg.chat.id, _chat_display_name(msg.chat),
+                      getattr(msg.chat, "type", None), record["ts"])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("note_chat failed: %s", exc)
 
     return dp
 
