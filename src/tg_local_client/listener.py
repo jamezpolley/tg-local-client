@@ -18,7 +18,7 @@ from typing import Optional
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 
-from .db import connect, now_ts, note_chat, write_channel_line
+from .db import BOT_SLUG, connect, now_ts, note_chat, write_channel_line
 
 log = logging.getLogger("tg-local-listener")
 
@@ -91,6 +91,7 @@ def build_inbound_record(msg: Message) -> dict:
     reply_to = getattr(msg, "reply_to_message", None)
     quote = getattr(msg, "quote", None)
     record = {
+        "bot_slug": BOT_SLUG,
         "telegram_msg_id": msg.message_id,
         "chat_id": msg.chat.id,
         "from_user_id": msg.from_user.id if msg.from_user else None,
@@ -115,12 +116,12 @@ def persist_inbound(record: dict) -> Optional[int]:
     try:
         cur = conn.execute(
             """INSERT OR IGNORE INTO messages
-               (telegram_msg_id, chat_id, from_user_id, from_username,
+               (bot_slug, telegram_msg_id, chat_id, from_user_id, from_username,
                 from_first_name, text, ts, direction,
                 media_type, media_file_id, media_file_unique_id,
                 media_mime_type, media_file_size, message_thread_id,
                 reply_to_telegram_msg_id, quote_text, quote_is_manual)
-               VALUES (:telegram_msg_id, :chat_id, :from_user_id, :from_username,
+               VALUES (:bot_slug, :telegram_msg_id, :chat_id, :from_user_id, :from_username,
                        :from_first_name, :text, :ts, 'in',
                        :media_type, :media_file_id, :media_file_unique_id,
                        :media_mime_type, :media_file_size, :message_thread_id,
@@ -144,9 +145,9 @@ def record_outbound(telegram_msg_id: int, chat_id: int, text: str) -> dict:
     try:
         cur = conn.execute(
             """INSERT OR IGNORE INTO messages
-               (telegram_msg_id, chat_id, text, ts, direction)
-               VALUES (?, ?, ?, ?, 'out')""",
-            (telegram_msg_id, chat_id, text, now_ts()),
+               (bot_slug, telegram_msg_id, chat_id, text, ts, direction)
+               VALUES (?, ?, ?, ?, ?, 'out')""",
+            (BOT_SLUG, telegram_msg_id, chat_id, text, now_ts()),
         )
         row_id = cur.lastrowid
     finally:

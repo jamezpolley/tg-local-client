@@ -37,6 +37,7 @@ def _data_dir() -> Path:
 DATA_DIR = _data_dir()
 DB_PATH = DATA_DIR / "messages.db"
 MEDIA_DIR = DATA_DIR / "media"
+BOT_SLUG = (load_config().get("bot_slug") or "").strip()
 
 
 def is_private_chat(chat_id: int) -> bool:
@@ -91,6 +92,7 @@ def all_known_chat_ids() -> list[int]:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  bot_slug TEXT NOT NULL DEFAULT '',
   telegram_msg_id INTEGER,
   chat_id INTEGER NOT NULL,
   from_user_id INTEGER,
@@ -110,7 +112,7 @@ CREATE TABLE IF NOT EXISTS messages (
   reply_to_telegram_msg_id INTEGER,
   quote_text TEXT,
   quote_is_manual INTEGER,
-  UNIQUE(telegram_msg_id, chat_id, direction)
+  UNIQUE(telegram_msg_id, chat_id, direction, bot_slug)
 );
 CREATE INDEX IF NOT EXISTS idx_chat_ts ON messages(chat_id, ts);
 CREATE INDEX IF NOT EXISTS idx_unread ON messages(read_at) WHERE read_at IS NULL AND direction = 'in';
@@ -148,6 +150,58 @@ _MIGRATIONS.append("""CREATE TABLE IF NOT EXISTS chats (
 )""")
 
 
+def _migrate_add_bot_slug(conn: sqlite3.Connection) -> None:
+    """Add bot_slug to the dedup UNIQUE key by rebuilding the messages table.
+
+    SQLite cannot ALTER a UNIQUE constraint, so we create messages_new with the
+    updated key, copy all rows (backfilling bot_slug from BOT_SLUG), drop the old
+    table, and rename. Idempotent: returns early if bot_slug column already exists.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    if "bot_slug" in cols:
+        return
+    conn.executescript("""
+        BEGIN;
+        CREATE TABLE messages_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          bot_slug TEXT NOT NULL DEFAULT '',
+          telegram_msg_id INTEGER,
+          chat_id INTEGER NOT NULL,
+          from_user_id INTEGER,
+          from_username TEXT,
+          from_first_name TEXT,
+          text TEXT,
+          ts INTEGER NOT NULL,
+          direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+          read_at INTEGER,
+          media_type TEXT,
+          media_file_id TEXT,
+          media_file_unique_id TEXT,
+          media_mime_type TEXT,
+          media_file_size INTEGER,
+          media_local_path TEXT,
+          message_thread_id INTEGER,
+          reply_to_telegram_msg_id INTEGER,
+          quote_text TEXT,
+          quote_is_manual INTEGER,
+          UNIQUE(telegram_msg_id, chat_id, direction, bot_slug)
+        );
+        INSERT INTO messages_new SELECT id, '', telegram_msg_id, chat_id,
+          from_user_id, from_username, from_first_name, text, ts, direction,
+          read_at, media_type, media_file_id, media_file_unique_id, media_mime_type,
+          media_file_size, media_local_path, message_thread_id,
+          reply_to_telegram_msg_id, quote_text, quote_is_manual FROM messages;
+        DROP TABLE messages;
+        ALTER TABLE messages_new RENAME TO messages;
+        CREATE INDEX IF NOT EXISTS idx_chat_ts ON messages(chat_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_unread ON messages(read_at)
+          WHERE read_at IS NULL AND direction = 'in';
+        COMMIT;
+    """)
+    # Backfill existing rows with this bot's slug (parameterized — avoids f-string SQL).
+    conn.execute("UPDATE messages SET bot_slug = ? WHERE bot_slug = ''", (BOT_SLUG,))
+
+
 def connect() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -159,6 +213,7 @@ def connect() -> sqlite3.Connection:
             conn.execute(stmt)
         except sqlite3.OperationalError:
             pass  # column/table already exists
+    _migrate_add_bot_slug(conn)
     return conn
 
 

@@ -6,11 +6,14 @@ import tg_local_client.db as db
 import tg_local_client.listener as listener
 
 
-def _reload_data_dir(tmp_path, monkeypatch):
+def _reload_data_dir(tmp_path, monkeypatch, bot_slug="test"):
     """Point the db module at a temp data dir."""
     monkeypatch.setattr(db, "DATA_DIR", tmp_path)
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "messages.db")
     monkeypatch.setattr(db, "MEDIA_DIR", tmp_path / "media")
+    monkeypatch.setattr(db, "BOT_SLUG", bot_slug)
+    import tg_local_client.listener as _listener
+    monkeypatch.setattr(_listener, "BOT_SLUG", bot_slug)
 
 
 def _fake_message(text="hello", chat_id=-100123, msg_id=1, reply_to_id=None,
@@ -117,10 +120,30 @@ def test_persist_inbound_dedupes(tmp_path, monkeypatch):
     _reload_data_dir(tmp_path, monkeypatch)
     rec = listener.build_inbound_record(_fake_message(msg_id=99))
     assert listener.persist_inbound(rec) is not None
-    # Same telegram_msg_id + chat_id → duplicate, dropped, no second jsonl line.
+    # Same telegram_msg_id + chat_id + bot_slug → duplicate, dropped, no second jsonl line.
     assert listener.persist_inbound(rec) is None
     ch_file = tmp_path / "channels" / "-100123.jsonl"
     assert len(ch_file.read_text().splitlines()) == 1
+
+
+def test_persist_inbound_allows_different_bot_slug(tmp_path, monkeypatch):
+    """Two bots sharing a data dir must NOT dedup each other's DMs."""
+    _reload_data_dir(tmp_path, monkeypatch, bot_slug="bot-a")
+    rec_a = listener.build_inbound_record(_fake_message(msg_id=50))
+    assert listener.persist_inbound(rec_a) is not None
+
+    # Simulate a second bot with the same telegram_msg_id landing in the same DB.
+    monkeypatch.setattr(db, "BOT_SLUG", "bot-b")
+    monkeypatch.setattr(listener, "BOT_SLUG", "bot-b")
+    rec_b = listener.build_inbound_record(_fake_message(msg_id=50))
+    assert listener.persist_inbound(rec_b) is not None, \
+        "different bot_slug must not be deduped by the same telegram_msg_id"
+
+
+def test_build_inbound_record_includes_bot_slug(tmp_path, monkeypatch):
+    _reload_data_dir(tmp_path, monkeypatch, bot_slug="my-bot")
+    rec = listener.build_inbound_record(_fake_message(text="hi"))
+    assert rec["bot_slug"] == "my-bot"
 
 
 def test_chat_display_name_from_title():

@@ -516,7 +516,7 @@ def list_recent_messages(limit: int = 20, unread_only: bool = False,
     conn = connect()
     try:
         rows = conn.execute(
-            f"""SELECT id, telegram_msg_id, chat_id, from_user_id, from_username,
+            f"""SELECT id, bot_slug, telegram_msg_id, chat_id, from_user_id, from_username,
                        from_first_name, text, ts, read_at, message_thread_id,
                        reply_to_telegram_msg_id, quote_text, quote_is_manual,
                        media_type, media_file_id, media_file_size, media_mime_type
