@@ -15,7 +15,9 @@ the token) comes from config.local.json — see config.py.
 
 Sending:
   send_message        — text with optional parse_mode / reply_to / thread
-  send_typing         — chat action "typing" indicator
+  send_typing         — one-shot 5-second typing burst
+  start_typing        — self-refreshing typing loop; auto-stops on send_message
+  stop_typing         — cancel a start_typing loop early
   react_to_message    — set/clear a reaction emoji on a message
   edit_message        — edit text of a message this bot sent
   delete_message      — delete a message this bot sent
@@ -73,6 +75,36 @@ log = logging.getLogger("tg-local-mcp")
 _bot = None
 _poll_task: Optional[asyncio.Task] = None
 _config = load_config()
+
+# Active self-refreshing typing tasks: {(chat_id, message_thread_id): asyncio.Task}.
+# Keyed so start_typing restarts cleanly and send_message cancels automatically.
+_typing_tasks: dict = {}
+
+
+async def _typing_loop(bot, chat_id: int, thread_id: Optional[int],
+                       max_seconds: int) -> None:
+    """Re-send Telegram typing action every 5s for up to max_seconds."""
+    elapsed = 0
+    try:
+        while elapsed < max_seconds:
+            with contextlib.suppress(Exception):
+                await bot.send_chat_action(
+                    chat_id=chat_id, action="typing",
+                    message_thread_id=thread_id,
+                )
+            await asyncio.sleep(5)
+            elapsed += 5
+    except asyncio.CancelledError:
+        pass
+
+
+def _cancel_typing(chat_id: int, thread_id: Optional[int]) -> None:
+    """Cancel any active typing loop for this (chat_id, thread_id) pair."""
+    key = (chat_id, thread_id)
+    task = _typing_tasks.get(key)
+    if task and not task.done():
+        task.cancel()
+    _typing_tasks.pop(key, None)
 
 
 def _default_target() -> Optional[int]:
@@ -163,6 +195,7 @@ async def send_message(
     """
     bot = _require_bot()
     target = _resolve_target(chat_id)
+    _cancel_typing(target, message_thread_id)
     sent = await bot.send_message(
         chat_id=target,
         text=text,
@@ -196,6 +229,57 @@ async def send_typing(
         message_thread_id=message_thread_id,
     )
     return {"chat_id": target, "ok": True}
+
+
+@mcp.tool()
+async def start_typing(
+    chat_id: Optional[int] = None,
+    message_thread_id: Optional[int] = None,
+    duration_seconds: int = 300,
+) -> dict:
+    """Start a self-refreshing typing indicator that persists until you send a message.
+
+    Sends the Telegram "typing…" action every ~5 seconds for up to duration_seconds
+    (default 300 = 5 minutes). Automatically stops when send_message is called for
+    the same chat. Call stop_typing to cancel early.
+
+    Use this at the start of any response that will take more than ~5 seconds —
+    call it before doing work, then send_message when done. The indicator stops on
+    its own when send_message fires.
+
+    chat_id: defaults to the first configured group.
+    message_thread_id: routes the indicator to a forum topic thread.
+    duration_seconds: hard cap (default 300s / 5 min).
+
+    Returns {chat_id, ok: True}.
+    """
+    bot = _require_bot()
+    target = _resolve_target(chat_id)
+    _cancel_typing(target, message_thread_id)
+    task = asyncio.create_task(
+        _typing_loop(bot, target, message_thread_id, duration_seconds)
+    )
+    _typing_tasks[(target, message_thread_id)] = task
+    return {"chat_id": target, "ok": True}
+
+
+@mcp.tool()
+async def stop_typing(
+    chat_id: Optional[int] = None,
+    message_thread_id: Optional[int] = None,
+) -> dict:
+    """Stop a self-refreshing typing indicator started with start_typing.
+
+    Normally not needed — send_message cancels automatically. Use this if you
+    decide not to send a message after all (e.g. on error or standing down).
+
+    Returns {chat_id, ok: True, was_active: bool}.
+    """
+    target = _resolve_target(chat_id)
+    key = (target, message_thread_id)
+    was_active = key in _typing_tasks and not _typing_tasks[key].done()
+    _cancel_typing(target, message_thread_id)
+    return {"chat_id": target, "ok": True, "was_active": was_active}
 
 
 @mcp.tool()
