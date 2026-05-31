@@ -318,6 +318,48 @@ def test_triage_filters_line_in_emit(capsys):
         _tail._triage_mod.should_act = original
 
 
+def test_message_text_for_triage_empty_returns_blank():
+    """Empty / whitespace / absent text → "" (NOT the raw JSON line — that was the
+    bias-to-ACT leak); real text passes through; unparseable → raw line so it still
+    reaches the fail-safe classifier."""
+    assert triage.message_text_for_triage(json.dumps({"text": ""})) == ""
+    assert triage.message_text_for_triage(json.dumps({"text": "   "})) == ""
+    assert triage.message_text_for_triage(json.dumps({"text": None})) == ""
+    assert triage.message_text_for_triage(json.dumps({"from_username": "u"})) == ""
+    assert triage.message_text_for_triage(json.dumps({"text": "hi there"})) == "hi there"
+    assert triage.message_text_for_triage("not json at all") == "not json at all"
+
+
+def test_triage_drops_empty_text_before_classifier(capsys):
+    """Empty/whitespace-text records (untagged service events, caption-less media,
+    empty sends) are SKIPped BEFORE the Haiku — even when the classifier would
+    ACT — and the classifier is never consulted for them. A texted record still
+    flows through normally."""
+    cfg = triage.TriageConfig(role="test")
+    import tg_local_client.tail as _tail
+    seen = []
+
+    def _always_act(message, config, invoke=None):
+        seen.append(message)
+        return True
+
+    original = _tail._triage_mod.should_act
+    _tail._triage_mod.should_act = _always_act
+    try:
+        empty = json.dumps({"text": "", "from_username": "jaypoe"})
+        texted = json.dumps({"text": "real msg", "from_username": "jaypoe"})
+        _tail._emit(empty, has_filters=False, from_username=None,
+                    message_thread_id=None, triage_config=cfg)
+        _tail._emit(texted, has_filters=False, from_username=None,
+                    message_thread_id=None, triage_config=cfg)
+        out = [ln for ln in capsys.readouterr().out.splitlines() if ln]
+        assert len(out) == 1                       # only the texted record emitted
+        assert json.loads(out[0])["text"] == "real msg"
+        assert seen == ["real msg"]                # classifier never saw the empty record
+    finally:
+        _tail._triage_mod.should_act = original
+
+
 def test_triage_passes_line_in_emit(capsys):
     """_emit emits a line when triage returns ACT."""
     cfg = triage.TriageConfig(role="test")
