@@ -79,10 +79,17 @@ def build_inbound_record(msg: Message) -> dict:
 
     `reply_to_telegram_msg_id` is set when the message is a reply to another
     message, so the monitoring agent can thread correctly.
+
+    `quote_text` captures the specific snippet a human highlights when
+    quote-replying (Telegram's `msg.quote`). It's vital context — exactly the
+    excerpt the human was pointing at; without it the agent only sees the whole
+    replied-to message. `quote_is_manual` distinguishes a hand-picked selection
+    from an auto-quote.
     """
     text = msg.text or msg.caption or ""
     ts = int(msg.date.timestamp()) if getattr(msg, "date", None) else now_ts()
     reply_to = getattr(msg, "reply_to_message", None)
+    quote = getattr(msg, "quote", None)
     record = {
         "telegram_msg_id": msg.message_id,
         "chat_id": msg.chat.id,
@@ -93,6 +100,8 @@ def build_inbound_record(msg: Message) -> dict:
         "ts": ts,
         "message_thread_id": getattr(msg, "message_thread_id", None),
         "reply_to_telegram_msg_id": reply_to.message_id if reply_to else None,
+        "quote_text": quote.text if quote else None,
+        "quote_is_manual": bool(quote.is_manual) if quote else None,
         **_media_info(msg),
     }
     return record
@@ -110,12 +119,12 @@ def persist_inbound(record: dict) -> Optional[int]:
                 from_first_name, text, ts, direction,
                 media_type, media_file_id, media_file_unique_id,
                 media_mime_type, media_file_size, message_thread_id,
-                reply_to_telegram_msg_id)
+                reply_to_telegram_msg_id, quote_text, quote_is_manual)
                VALUES (:telegram_msg_id, :chat_id, :from_user_id, :from_username,
                        :from_first_name, :text, :ts, 'in',
                        :media_type, :media_file_id, :media_file_unique_id,
                        :media_mime_type, :media_file_size, :message_thread_id,
-                       :reply_to_telegram_msg_id)""",
+                       :reply_to_telegram_msg_id, :quote_text, :quote_is_manual)""",
             record,
         )
         if not cur.rowcount:
