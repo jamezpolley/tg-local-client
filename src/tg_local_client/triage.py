@@ -170,13 +170,23 @@ def should_act(message: str, config: TriageConfig,
 def message_text_for_triage(line: str) -> str:
     """Extract the human-meaningful text to hand the classifier from a JSONL line.
 
-    Prefers the record's `text`; falls back to the whole line so a record without
-    a text field still gets classified (and, given the ACT bias, tends to pass).
+    Returns the record's `text` when it has real content; returns "" when `text`
+    is absent/empty/whitespace-only. Such records — untagged service events (this
+    client's listener writes chat_member_added etc. as a plain `text=""` record,
+    with no service marker), caption-less media (stickers/photos with no caption),
+    and empty sends — carry nothing to classify. Callers treat "" as a
+    deterministic SKIP (see tail._triage_passes).
+
+    Crucially this does NOT fall back to the raw JSON line for empty text: doing so
+    handed a textless blob to the bias-to-ACT classifier, waking the agent on every
+    such record. Unparseable / non-dict lines DO return the raw line, so they still
+    reach the (fail-safe) classifier rather than being silently dropped here.
     """
     try:
         record = json.loads(line)
     except (json.JSONDecodeError, ValueError):
         return line
     if isinstance(record, dict):
-        return record.get("text") or line
+        text = record.get("text")
+        return text if isinstance(text, str) and text.strip() else ""
     return line

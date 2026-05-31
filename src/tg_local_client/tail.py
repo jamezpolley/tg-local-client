@@ -394,6 +394,12 @@ def _triage_passes(line: str, triage_config) -> bool:
     if triage_config is None:
         return True
     message = _triage_mod.message_text_for_triage(line)
+    # Empty/whitespace text (untagged service events, caption-less media, empty
+    # sends) → deterministic SKIP, gated BEFORE the Haiku. This is a known-empty
+    # message, not a classifier error, so the fail-safe-ACT path must not apply —
+    # otherwise every such record would wake the agent.
+    if not message:
+        return False
     return _triage_mod.should_act(message, triage_config)
 
 
