@@ -116,28 +116,29 @@ def test_persist_inbound_stores_reply_to(tmp_path, monkeypatch):
     assert row["reply_to_telegram_msg_id"] == 3
 
 
-def test_persist_inbound_dedupes(tmp_path, monkeypatch):
+def test_persist_inbound_stores_all_copies(tmp_path, monkeypatch):
+    """Append-only: same telegram_msg_id stored twice (e.g. edit or duplicate delivery)."""
     _reload_data_dir(tmp_path, monkeypatch)
     rec = listener.build_inbound_record(_fake_message(msg_id=99))
-    assert listener.persist_inbound(rec) is not None
-    # Same telegram_msg_id + chat_id + bot_slug → duplicate, dropped, no second jsonl line.
-    assert listener.persist_inbound(rec) is None
+    id1 = listener.persist_inbound(rec)
+    id2 = listener.persist_inbound(rec)
+    assert id1 is not None
+    assert id2 is not None
+    assert id1 != id2
     ch_file = tmp_path / "channels" / "-100123.jsonl"
-    assert len(ch_file.read_text().splitlines()) == 1
+    assert len(ch_file.read_text().splitlines()) == 2
 
 
-def test_persist_inbound_allows_different_bot_slug(tmp_path, monkeypatch):
-    """Two bots sharing a data dir must NOT dedup each other's DMs."""
+def test_persist_inbound_stores_both_bot_slugs(tmp_path, monkeypatch):
+    """Two bots sharing a data dir each get their own row."""
     _reload_data_dir(tmp_path, monkeypatch, bot_slug="bot-a")
     rec_a = listener.build_inbound_record(_fake_message(msg_id=50))
     assert listener.persist_inbound(rec_a) is not None
 
-    # Simulate a second bot with the same telegram_msg_id landing in the same DB.
     monkeypatch.setattr(db, "BOT_SLUG", "bot-b")
     monkeypatch.setattr(listener, "BOT_SLUG", "bot-b")
     rec_b = listener.build_inbound_record(_fake_message(msg_id=50))
-    assert listener.persist_inbound(rec_b) is not None, \
-        "different bot_slug must not be deduped by the same telegram_msg_id"
+    assert listener.persist_inbound(rec_b) is not None
 
 
 def test_build_inbound_record_includes_bot_slug(tmp_path, monkeypatch):

@@ -111,11 +111,11 @@ CREATE TABLE IF NOT EXISTS messages (
   message_thread_id INTEGER,
   reply_to_telegram_msg_id INTEGER,
   quote_text TEXT,
-  quote_is_manual INTEGER,
-  UNIQUE(telegram_msg_id, chat_id, direction, bot_slug)
+  quote_is_manual INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_chat_ts ON messages(chat_id, ts);
 CREATE INDEX IF NOT EXISTS idx_unread ON messages(read_at) WHERE read_at IS NULL AND direction = 'in';
+CREATE INDEX IF NOT EXISTS idx_msg_lookup ON messages(telegram_msg_id, chat_id);
 """
 
 # Additive column migrations for older databases (run best-effort on every connect).
@@ -151,11 +151,11 @@ _MIGRATIONS.append("""CREATE TABLE IF NOT EXISTS chats (
 
 
 def _migrate_add_bot_slug(conn: sqlite3.Connection) -> None:
-    """Add bot_slug to the dedup UNIQUE key by rebuilding the messages table.
+    """Add bot_slug column and drop the UNIQUE dedup constraint (append-only design).
 
-    SQLite cannot ALTER a UNIQUE constraint, so we create messages_new with the
-    updated key, copy all rows (backfilling bot_slug from BOT_SLUG), drop the old
-    table, and rename. Idempotent: returns early if bot_slug column already exists.
+    SQLite cannot ALTER a UNIQUE constraint, so we rebuild the table. The new schema
+    has no UNIQUE on messages — every delivery is appended, dedup happens at read time.
+    Idempotent: returns early if bot_slug column already exists.
     """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
     if "bot_slug" in cols:
@@ -183,8 +183,7 @@ def _migrate_add_bot_slug(conn: sqlite3.Connection) -> None:
           message_thread_id INTEGER,
           reply_to_telegram_msg_id INTEGER,
           quote_text TEXT,
-          quote_is_manual INTEGER,
-          UNIQUE(telegram_msg_id, chat_id, direction, bot_slug)
+          quote_is_manual INTEGER
         );
         INSERT INTO messages_new SELECT id, '', telegram_msg_id, chat_id,
           from_user_id, from_username, from_first_name, text, ts, direction,
@@ -196,6 +195,7 @@ def _migrate_add_bot_slug(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_chat_ts ON messages(chat_id, ts);
         CREATE INDEX IF NOT EXISTS idx_unread ON messages(read_at)
           WHERE read_at IS NULL AND direction = 'in';
+        CREATE INDEX IF NOT EXISTS idx_msg_lookup ON messages(telegram_msg_id, chat_id);
         COMMIT;
     """)
     # Backfill existing rows with this bot's slug (parameterized — avoids f-string SQL).
