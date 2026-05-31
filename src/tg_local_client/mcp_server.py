@@ -14,10 +14,11 @@ the token) comes from config.local.json — see config.py.
 ## Tool set (single-bot adaption of the fabric tool surface)
 
 Sending:
-  send_message        — text with optional parse_mode / reply_to / thread
-  send_typing         — one-shot 5-second typing burst
-  start_typing        — self-refreshing typing loop; auto-stops on send_message
-  stop_typing         — cancel a start_typing loop early
+  send_message          — text with optional parse_mode / reply_to / thread
+  stream_message_draft  — send-or-edit: first call sends, subsequent calls edit
+  send_typing           — one-shot 5-second typing burst
+  start_typing          — self-refreshing typing loop; auto-stops on send_message
+  stop_typing           — cancel a start_typing loop early
   react_to_message    — set/clear a reaction emoji on a message
   edit_message        — edit text of a message this bot sent
   delete_message      — delete a message this bot sent
@@ -204,6 +205,58 @@ async def send_message(
         reply_to_message_id=reply_to_message_id,
     )
     return record_outbound(sent.message_id, target, text)
+
+
+@mcp.tool()
+async def stream_message_draft(
+    text: str,
+    chat_id: Optional[int] = None,
+    message_thread_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+    parse_mode: Optional[str] = None,
+) -> dict:
+    """Send-or-edit a progressive draft message — the thinking→edit pattern as one tool.
+
+    First call (message_id=None): sends a new message and returns its telegram_msg_id.
+    Subsequent calls (message_id=<id>): edits that message in place with the new text.
+
+    Typical usage:
+      1. draft = stream_message_draft("💭 thinking…", chat_id=X)   # sends
+      2. stream_message_draft("Here is my answer…", chat_id=X, message_id=draft["telegram_msg_id"])
+      3. (repeat step 2 as content grows)
+
+    Compared to separate send_message + edit_message calls, this keeps the
+    message_id threaded through a single tool and auto-stops any active typing
+    indicator on the first send.
+
+    text: message body (Telegram limit 4096 chars).
+    chat_id: defaults to the first configured group.
+    message_thread_id: for forum-topic threads.
+    message_id: telegram_msg_id of an existing draft to update. None = send new.
+    parse_mode: 'HTML', 'MarkdownV2', or 'Markdown'. Default plain text.
+
+    Returns {telegram_msg_id, chat_id, is_new}.
+    """
+    bot = _require_bot()
+    target = _resolve_target(chat_id)
+    if message_id is None:
+        _cancel_typing(target, message_thread_id)
+        sent = await bot.send_message(
+            chat_id=target,
+            text=text,
+            message_thread_id=message_thread_id,
+            parse_mode=parse_mode,
+        )
+        record_outbound(sent.message_id, target, text)
+        return {"telegram_msg_id": sent.message_id, "chat_id": target, "is_new": True}
+    else:
+        await bot.edit_message_text(
+            chat_id=target,
+            message_id=message_id,
+            text=text,
+            parse_mode=parse_mode,
+        )
+        return {"telegram_msg_id": message_id, "chat_id": target, "is_new": False}
 
 
 @mcp.tool()
