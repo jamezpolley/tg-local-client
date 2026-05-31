@@ -515,12 +515,22 @@ def list_recent_messages(limit: int = 20, unread_only: bool = False,
     params.append(limit)
     conn = connect()
     try:
+        # Dedup at read time: for each (telegram_msg_id, chat_id) keep the latest row
+        # (highest id). Edits are stored as new rows; this surfaces only the current
+        # version. COALESCE handles the rare case of a NULL telegram_msg_id.
         rows = conn.execute(
-            f"""SELECT id, telegram_msg_id, chat_id, from_user_id, from_username,
+            f"""WITH ranked AS (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(telegram_msg_id, -id), chat_id
+                        ORDER BY id DESC
+                    ) AS _rn
+                    FROM messages WHERE {" AND ".join(where)}
+                )
+                SELECT id, bot_slug, telegram_msg_id, chat_id, from_user_id, from_username,
                        from_first_name, text, ts, read_at, message_thread_id,
                        reply_to_telegram_msg_id, quote_text, quote_is_manual,
                        media_type, media_file_id, media_file_size, media_mime_type
-                FROM messages WHERE {" AND ".join(where)}
+                FROM ranked WHERE _rn = 1
                 ORDER BY ts DESC LIMIT ?""",
             params,
         ).fetchall()

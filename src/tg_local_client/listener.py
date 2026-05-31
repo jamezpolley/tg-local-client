@@ -18,7 +18,7 @@ from typing import Optional
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 
-from .db import connect, now_ts, note_chat, write_channel_line
+from .db import BOT_SLUG, connect, now_ts, note_chat, write_channel_line
 
 log = logging.getLogger("tg-local-listener")
 
@@ -91,6 +91,7 @@ def build_inbound_record(msg: Message) -> dict:
     reply_to = getattr(msg, "reply_to_message", None)
     quote = getattr(msg, "quote", None)
     record = {
+        "bot_slug": BOT_SLUG,
         "telegram_msg_id": msg.message_id,
         "chat_id": msg.chat.id,
         "from_user_id": msg.from_user.id if msg.from_user else None,
@@ -107,28 +108,29 @@ def build_inbound_record(msg: Message) -> dict:
     return record
 
 
-def persist_inbound(record: dict) -> Optional[int]:
-    """Insert an inbound record into SQLite (dedup on telegram_msg_id+chat_id) and,
-    if newly inserted, append it to the per-channel JSONL. Returns the DB row id, or
-    None if it was a duplicate."""
+def persist_inbound(record: dict) -> int:
+    """Append an inbound record to SQLite and the per-channel JSONL.
+
+    Append-only: every delivery is stored, including edits and duplicate deliveries.
+    Dedup (latest per telegram_msg_id) happens at read time in list_recent_messages.
+    Returns the DB row id.
+    """
     conn = connect()
     try:
         cur = conn.execute(
-            """INSERT OR IGNORE INTO messages
-               (telegram_msg_id, chat_id, from_user_id, from_username,
+            """INSERT INTO messages
+               (bot_slug, telegram_msg_id, chat_id, from_user_id, from_username,
                 from_first_name, text, ts, direction,
                 media_type, media_file_id, media_file_unique_id,
                 media_mime_type, media_file_size, message_thread_id,
                 reply_to_telegram_msg_id, quote_text, quote_is_manual)
-               VALUES (:telegram_msg_id, :chat_id, :from_user_id, :from_username,
+               VALUES (:bot_slug, :telegram_msg_id, :chat_id, :from_user_id, :from_username,
                        :from_first_name, :text, :ts, 'in',
                        :media_type, :media_file_id, :media_file_unique_id,
                        :media_mime_type, :media_file_size, :message_thread_id,
                        :reply_to_telegram_msg_id, :quote_text, :quote_is_manual)""",
             record,
         )
-        if not cur.rowcount:
-            return None
         row_id = cur.lastrowid
     finally:
         conn.close()
@@ -143,10 +145,10 @@ def record_outbound(telegram_msg_id: int, chat_id: int, text: str) -> dict:
     conn = connect()
     try:
         cur = conn.execute(
-            """INSERT OR IGNORE INTO messages
-               (telegram_msg_id, chat_id, text, ts, direction)
-               VALUES (?, ?, ?, ?, 'out')""",
-            (telegram_msg_id, chat_id, text, now_ts()),
+            """INSERT INTO messages
+               (bot_slug, telegram_msg_id, chat_id, text, ts, direction)
+               VALUES (?, ?, ?, ?, ?, 'out')""",
+            (BOT_SLUG, telegram_msg_id, chat_id, text, now_ts()),
         )
         row_id = cur.lastrowid
     finally:
@@ -161,8 +163,7 @@ def make_bot(token: str) -> Bot:
 def build_dispatcher() -> Dispatcher:
     dp = Dispatcher()
 
-    @dp.message()
-    async def on_message(msg: Message) -> None:  # noqa: ANN202
+    async def _handle(msg: Message) -> None:
         record = build_inbound_record(msg)
         persist_inbound(record)
         # Record the chat's human-readable name + type so list_known_chats can
@@ -173,6 +174,11 @@ def build_dispatcher() -> Dispatcher:
                       getattr(msg.chat, "type", None), record["ts"])
         except Exception as exc:  # noqa: BLE001
             log.warning("note_chat failed: %s", exc)
+
+    dp.message()(_handle)
+    # Edits are appended as new rows (same telegram_msg_id, updated text).
+    # list_recent_messages deduplicates at read time, showing the latest version.
+    dp.edited_message()(_handle)
 
     return dp
 
