@@ -52,6 +52,18 @@ def is_private_chat(chat_id: int) -> bool:
     return chat_id > 0
 
 
+def bot_jsonl_path() -> Path:
+    """Single per-bot JSONL file: channels/<bot_slug>.jsonl.
+
+    All inbound messages (DMs + every group the bot is in) are appended here in
+    arrival order. tg-local-tail watches this one file; per-channel files are kept
+    as secondary copies for backward compatibility.
+    """
+    p = DATA_DIR / "channels" / f"{BOT_SLUG}.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def channel_jsonl_path(chat_id: int, bot_slug: Optional[str] = None) -> Path:
     """Per-channel JSONL file path for a chat_id (created lazily).
 
@@ -222,16 +234,24 @@ def now_ts() -> int:
 
 
 def write_channel_line(record: dict, bot_slug: Optional[str] = None) -> None:
-    """Append one record as a compact JSON line to its per-channel file.
+    """Append one record to the per-bot file and the per-channel file.
 
-    bot_slug: when provided, private-chat files are bot-keyed
-    (channels/<chat_id>__<bot_slug>.jsonl) to avoid cross-bot DM bleed.
-    Group files are always the shared flat scheme.
+    The per-bot file (channels/<bot_slug>.jsonl) is the primary tail target —
+    every message from every chat lands here in arrival order.  The per-channel
+    file is kept as a secondary copy for backward compatibility.
     """
-    ch_path = channel_jsonl_path(record["chat_id"], bot_slug)
-    with ch_path.open("a") as f:
-        f.write(json.dumps(record) + "\n")
+    line = json.dumps(record) + "\n"
+    # Primary: per-bot aggregated file (single file for tg-local-tail).
+    bot_path = bot_jsonl_path()
+    with bot_path.open("a") as f:
+        f.write(line)
         f.flush()
+    # Secondary: per-channel file (backward compat; kept but not tailed).
+    ch_path = channel_jsonl_path(record["chat_id"], bot_slug)
+    if ch_path != bot_path:
+        with ch_path.open("a") as f:
+            f.write(line)
+            f.flush()
 
 
 def note_chat(chat_id: int, title: Optional[str], chat_type: Optional[str],

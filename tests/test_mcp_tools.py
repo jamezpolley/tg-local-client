@@ -14,11 +14,12 @@ def _unwrap(tool):
     return getattr(tool, "fn", tool)
 
 
-def _reload_data_dir(tmp_path, monkeypatch):
+def _reload_data_dir(tmp_path, monkeypatch, bot_slug="test"):
     """Point the db module at a temp data dir so tests never touch the real DB."""
     monkeypatch.setattr(db, "DATA_DIR", tmp_path)
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "messages.db")
     monkeypatch.setattr(db, "MEDIA_DIR", tmp_path / "media")
+    monkeypatch.setattr(db, "BOT_SLUG", bot_slug)
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +317,8 @@ def test_list_known_chats_returns_rows(monkeypatch, tmp_path):
 # get_tail_command
 # ---------------------------------------------------------------------------
 
-def test_get_tail_command_is_flat_and_pipe_free(monkeypatch):
+def test_get_tail_command_is_flat_and_pipe_free(monkeypatch, tmp_path):
+    _reload_data_dir(tmp_path, monkeypatch, bot_slug="mybot")
     monkeypatch.setattr(mcp_server, "_config", {"group_chat_ids": [-100999]})
     fn = _unwrap(mcp_server.get_tail_command)
     out = fn()
@@ -325,7 +327,9 @@ def test_get_tail_command_is_flat_and_pipe_free(monkeypatch):
         assert forbidden not in cmd, f"command contains forbidden token {forbidden!r}: {cmd}"
     assert cmd.startswith("uv run --directory ")
     assert "tg-local-tail" in cmd
-    assert any("-100999.jsonl" in p for p in out["jsonl_paths"])
+    # Always returns a single per-bot file.
+    assert len(out["jsonl_paths"]) == 1
+    assert "mybot.jsonl" in out["jsonl_paths"][0]
 
 
 def test_get_tail_command_filter_sanitised(monkeypatch):
@@ -336,13 +340,14 @@ def test_get_tail_command_filter_sanitised(monkeypatch):
     assert ";" not in out["command"]
 
 
-def test_get_tail_command_raises_when_no_group_and_no_known_chats(monkeypatch, tmp_path):
-    """When the DB has no messages AND config has no group_chat_ids, raise."""
-    _reload_data_dir(tmp_path, monkeypatch)
+def test_get_tail_command_always_returns_per_bot_file(monkeypatch, tmp_path):
+    """get_tail_command always returns the single per-bot file, even on fresh install."""
+    _reload_data_dir(tmp_path, monkeypatch, bot_slug="mybot")
     monkeypatch.setattr(mcp_server, "_config", {"group_chat_ids": []})
     fn = _unwrap(mcp_server.get_tail_command)
-    with pytest.raises(RuntimeError, match="group_chat_ids"):
-        fn()
+    out = fn()
+    assert len(out["jsonl_paths"]) == 1
+    assert "mybot.jsonl" in out["jsonl_paths"][0]
 
 
 def test_get_tail_command_wake_on_mention(monkeypatch):
@@ -381,8 +386,9 @@ def test_get_tail_command_triage_strips_shell_ops(monkeypatch):
     assert "&&" not in role
 
 
-def test_get_tail_command_channel_topics(monkeypatch):
-    """Per-channel topic specs produce --channel-topics= flags."""
+def test_get_tail_command_channel_topics(monkeypatch, tmp_path):
+    """Per-channel topic specs produce --channel-topics= flags; still one per-bot file."""
+    _reload_data_dir(tmp_path, monkeypatch, bot_slug="mybot")
     monkeypatch.setattr(mcp_server, "_config", {"group_chat_ids": [-100999]})
     fn = _unwrap(mcp_server.get_tail_command)
     out = fn(channels=[{"chat_id": -100999, "topics": "general"},
@@ -390,7 +396,7 @@ def test_get_tail_command_channel_topics(monkeypatch):
     cmd = out["command"]
     assert "--channel-topics=-100999:general" in cmd
     assert "--channel-topics=-10007:5,9" in cmd
-    assert len(out["jsonl_paths"]) == 2
+    assert len(out["jsonl_paths"]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -485,51 +491,39 @@ def test_download_media_no_media_field(monkeypatch, tmp_path):
 # Fix 2: drift-proof all-membership tail — live-derive channels from DB
 # ---------------------------------------------------------------------------
 
-def test_get_tail_command_no_args_uses_all_known_chats(monkeypatch, tmp_path):
-    """With no chat_id / channels args, tail command covers ALL chats in the DB,
-    not just group_chat_ids[0]."""
-    _reload_data_dir(tmp_path, monkeypatch)
+def test_get_tail_command_no_args_returns_single_per_bot_file(monkeypatch, tmp_path):
+    """With no args, always returns the single per-bot file regardless of DB contents."""
+    _reload_data_dir(tmp_path, monkeypatch, bot_slug="mybot")
     monkeypatch.setattr(mcp_server, "_config", {"group_chat_ids": [-100999]})
 
-    # Seed the DB with messages from a DM chat not in the static config.
     conn = db.connect()
     conn.execute("INSERT INTO messages (telegram_msg_id, chat_id, text, ts, direction) "
                  "VALUES (1, -100999, 'group msg', 1, 'in')")
     conn.execute("INSERT INTO messages (telegram_msg_id, chat_id, text, ts, direction) "
-                 "VALUES (2, 174969502, 'dm msg', 2, 'in')")  # DM not in config
+                 "VALUES (2, 174969502, 'dm msg', 2, 'in')")
     conn.close()
 
     fn = _unwrap(mcp_server.get_tail_command)
     out = fn()
-    cmd = out["command"]
-
-    # Both channels appear in the tail command.
-    assert "-100999.jsonl" in cmd
-    assert "174969502.jsonl" in cmd
-    assert len(out["jsonl_paths"]) == 2
+    assert len(out["jsonl_paths"]) == 1
+    assert "mybot.jsonl" in out["jsonl_paths"][0]
 
 
-def test_get_tail_command_no_args_falls_back_to_config_seed_when_db_empty(monkeypatch, tmp_path):
-    """When the DB is empty (fresh install), fall back to group_chat_ids seed."""
-    _reload_data_dir(tmp_path, monkeypatch)
+def test_get_tail_command_fresh_install_returns_per_bot_file(monkeypatch, tmp_path):
+    """Even on fresh install with no messages, the per-bot file path is returned."""
+    _reload_data_dir(tmp_path, monkeypatch, bot_slug="mybot")
     monkeypatch.setattr(mcp_server, "_config", {"group_chat_ids": [-100999]})
-
-    # DB is empty — no messages yet.
     db.connect().close()
 
     fn = _unwrap(mcp_server.get_tail_command)
     out = fn()
-    cmd = out["command"]
-
-    # Falls back to the configured group.
-    assert "-100999.jsonl" in cmd
     assert len(out["jsonl_paths"]) == 1
+    assert "mybot.jsonl" in out["jsonl_paths"][0]
 
 
-def test_get_tail_command_new_dm_picked_up_on_next_call(monkeypatch, tmp_path):
-    """A new DM arriving after a session started is included on the NEXT call to
-    get_tail_command with no args (because all_known_chat_ids re-queries the DB)."""
-    _reload_data_dir(tmp_path, monkeypatch)
+def test_get_tail_command_new_dm_still_single_file(monkeypatch, tmp_path):
+    """New DMs don't change the file count — all chats land in the per-bot file."""
+    _reload_data_dir(tmp_path, monkeypatch, bot_slug="mybot")
     monkeypatch.setattr(mcp_server, "_config", {"group_chat_ids": [-100999]})
 
     conn = db.connect()
@@ -541,16 +535,13 @@ def test_get_tail_command_new_dm_picked_up_on_next_call(monkeypatch, tmp_path):
     out1 = fn()
     assert len(out1["jsonl_paths"]) == 1
 
-    # New DM arrives — recorded in DB.
     conn = db.connect()
     conn.execute("INSERT INTO messages (telegram_msg_id, chat_id, text, ts, direction) "
                  "VALUES (2, 999888777, 'new dm', 2, 'in')")
     conn.close()
 
     out2 = fn()
-    assert len(out2["jsonl_paths"]) == 2
-    paths_str = " ".join(out2["jsonl_paths"])
-    assert "999888777.jsonl" in paths_str
+    assert len(out2["jsonl_paths"]) == 1  # still one per-bot file
 
 
 def test_all_known_chat_ids_db_helper(monkeypatch, tmp_path):

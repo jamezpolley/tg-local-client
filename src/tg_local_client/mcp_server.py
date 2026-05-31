@@ -63,8 +63,8 @@ from fastmcp import FastMCP
 
 from ._version import CLIENT_VERSION
 from .config import default_chat_id, load_config, resolve_token, token_env_var
-from .db import (channel_jsonl_path, connect, now_ts, trusted_user_ids,
-                 all_known_chat_ids, DATA_DIR, MEDIA_DIR)
+from .db import (bot_jsonl_path, channel_jsonl_path, connect, now_ts,
+                 trusted_user_ids, all_known_chat_ids, DATA_DIR, MEDIA_DIR)
 from .listener import make_bot, poll, record_outbound
 
 log = logging.getLogger("tg-local-mcp")
@@ -667,13 +667,12 @@ def get_tail_command(
 
     ## Routing
 
-    - `channels` given: tail the listed chat_ids (each may declare topic scope).
-    - `chat_id` given: tail just that channel's file.
-    - neither: **live-derive every channel** from the set of chat_ids already seen
-      in the local store (all_known_chat_ids). This closes the silent-drop gap
-      where a new DM arrives in a fresh channels/<id>.jsonl that a static-config
-      tail never opens. The config `group_chat_ids` acts as a seed/fallback only
-      when no messages have been captured yet (fresh install).
+    Always tails the single per-bot file (channels/<bot_slug>.jsonl) — one file
+    holds everything the bot sees: all DMs and every group it's in, in arrival
+    order. This matches the fabric's per-bot design.
+
+    `channels` and `chat_id` are retained as in-tail topic/thread filter hints
+    (via --channel-topics), not file selectors.
 
     ## Fine filtering (deterministic, all opt-in)
 
@@ -736,32 +735,10 @@ def get_tail_command(
             token = str(topics)
         channel_topic_tokens[cid] = token
 
-    # Determine which files to tail.
-    if channel_ids_from_spec:
-        files = [channel_jsonl_path(cid) for cid in channel_ids_from_spec]
-    elif chat_id is not None:
-        files = [channel_jsonl_path(chat_id)]
-    else:
-        # No channel args: live-derive EVERY channel from all_known_chat_ids()
-        # (the set of chat_ids recorded in the local store). This closes the
-        # silent-drop gap where a new DM to the bot lands in a fresh
-        # channels/<id>.jsonl that a static-config tail never opens.
-        # group_chat_ids from config acts as a fallback/seed so the command is
-        # still useful on a fresh install before any messages have been captured.
-        live_ids = all_known_chat_ids()
-        if live_ids:
-            files = [channel_jsonl_path(cid) for cid in live_ids]
-        else:
-            # Fall back to config seed (fresh install, no traffic yet).
-            target = _default_target()
-            if target is None:
-                raise RuntimeError(
-                    "No chat_id given, no messages captured yet, and no "
-                    "group_chat_ids configured. Add the chat_id of your group "
-                    "into config.local.json (group_chat_ids), or pass chat_id "
-                    "explicitly."
-                )
-            files = [channel_jsonl_path(target)]
+    # Always tail the single per-bot file — one file holds everything the bot
+    # sees (all DMs + all groups), matching the fabric's per-bot design.
+    # chat_id / channels args still control in-tail topic filters below.
+    files = [bot_jsonl_path()]
 
     file_paths = [str(f) for f in files]
     args = list(file_paths)
