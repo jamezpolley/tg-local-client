@@ -417,7 +417,9 @@ def list_recent_messages(limit: int = 20, unread_only: bool = False,
     chat_id: filter to a chat (defaults to all chats this client has seen).
 
     Each row includes reply_to_telegram_msg_id (non-null when the message is a
-    threaded reply), surfacing thread context for the monitoring agent.
+    threaded reply) and quote_text (non-null when the sender quote-replied,
+    highlighting a specific snippet) — both surfacing thread/quote context for the
+    monitoring agent. quote_is_manual is 1 for a hand-selected quote.
     """
     where = ["direction = 'in'"]
     params: list = []
@@ -432,7 +434,7 @@ def list_recent_messages(limit: int = 20, unread_only: bool = False,
         rows = conn.execute(
             f"""SELECT id, telegram_msg_id, chat_id, from_user_id, from_username,
                        from_first_name, text, ts, read_at, message_thread_id,
-                       reply_to_telegram_msg_id,
+                       reply_to_telegram_msg_id, quote_text, quote_is_manual,
                        media_type, media_file_id, media_file_size, media_mime_type
                 FROM messages WHERE {" AND ".join(where)}
                 ORDER BY ts DESC LIMIT ?""",

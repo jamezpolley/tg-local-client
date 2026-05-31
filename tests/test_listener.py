@@ -13,9 +13,12 @@ def _reload_data_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "MEDIA_DIR", tmp_path / "media")
 
 
-def _fake_message(text="hello", chat_id=-100123, msg_id=1, reply_to_id=None):
+def _fake_message(text="hello", chat_id=-100123, msg_id=1, reply_to_id=None,
+                  quote_text=None, quote_is_manual=None):
     reply_to = (SimpleNamespace(message_id=reply_to_id)
                 if reply_to_id is not None else None)
+    quote = (SimpleNamespace(text=quote_text, is_manual=quote_is_manual)
+             if quote_text is not None else None)
     return SimpleNamespace(
         message_id=msg_id,
         chat=SimpleNamespace(id=chat_id, title="Test Chat", type="supergroup"),
@@ -25,6 +28,7 @@ def _fake_message(text="hello", chat_id=-100123, msg_id=1, reply_to_id=None):
         date=SimpleNamespace(timestamp=lambda: 1700000000.0),
         message_thread_id=None,
         reply_to_message=reply_to,
+        quote=quote,
         photo=None, document=None, voice=None, audio=None, video=None,
         video_note=None, animation=None, sticker=None,
     )
@@ -47,6 +51,39 @@ def test_build_inbound_record_captures_reply_to():
 def test_build_inbound_record_reply_to_null_for_plain():
     rec = listener.build_inbound_record(_fake_message(text="plain"))
     assert rec["reply_to_telegram_msg_id"] is None
+
+
+def test_build_inbound_record_captures_quote():
+    rec = listener.build_inbound_record(_fake_message(
+        text="my reply", reply_to_id=7,
+        quote_text="the exact bit I meant", quote_is_manual=True))
+    assert rec["quote_text"] == "the exact bit I meant"
+    assert rec["quote_is_manual"] is True
+
+
+def test_build_inbound_record_quote_null_when_absent():
+    rec = listener.build_inbound_record(_fake_message(text="plain"))
+    assert rec["quote_text"] is None
+    assert rec["quote_is_manual"] is None
+
+
+def test_persist_inbound_stores_and_surfaces_quote(tmp_path, monkeypatch):
+    _reload_data_dir(tmp_path, monkeypatch)
+    rec = listener.build_inbound_record(_fake_message(
+        msg_id=11, quote_text="snippet", quote_is_manual=True))
+    listener.persist_inbound(rec)
+    # DB column round-trips (bool stored as 1).
+    conn = db.connect()
+    row = conn.execute(
+        "SELECT quote_text, quote_is_manual FROM messages WHERE telegram_msg_id = 11"
+    ).fetchone()
+    conn.close()
+    assert row["quote_text"] == "snippet"
+    assert row["quote_is_manual"] == 1
+    # And it lands in the per-channel JSONL the tail follows.
+    line = json.loads((tmp_path / "channels" / "-100123.jsonl").read_text().strip())
+    assert line["quote_text"] == "snippet"
+    assert line["quote_is_manual"] is True
 
 
 def test_persist_inbound_writes_channel_jsonl(tmp_path, monkeypatch):

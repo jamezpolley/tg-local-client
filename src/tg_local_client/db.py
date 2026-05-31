@@ -108,6 +108,8 @@ CREATE TABLE IF NOT EXISTS messages (
   media_local_path TEXT,
   message_thread_id INTEGER,
   reply_to_telegram_msg_id INTEGER,
+  quote_text TEXT,
+  quote_is_manual INTEGER,
   UNIQUE(telegram_msg_id, chat_id, direction)
 );
 CREATE INDEX IF NOT EXISTS idx_chat_ts ON messages(chat_id, ts);
@@ -117,6 +119,11 @@ CREATE INDEX IF NOT EXISTS idx_unread ON messages(read_at) WHERE read_at IS NULL
 # Additive column migrations for older databases (run best-effort on every connect).
 _MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN reply_to_telegram_msg_id INTEGER",
+    # Reply-quote: the specific snippet a human highlights when quote-replying
+    # (Telegram's message.quote). quote_text = the highlighted excerpt;
+    # quote_is_manual = 1 if the user manually selected it (vs auto-quoted).
+    "ALTER TABLE messages ADD COLUMN quote_text TEXT",
+    "ALTER TABLE messages ADD COLUMN quote_is_manual INTEGER",
 ]
 
 # trusted_identities — durable binding of Telegram user_ids to a logical identity
