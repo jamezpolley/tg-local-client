@@ -25,10 +25,17 @@ from typing import Optional
 
 CLIENT_DIR = Path(__file__).resolve().parent.parent.parent  # client/
 EXAMPLE_CONFIG_PATH = CLIENT_DIR / "config.example.json"
-LOCAL_CONFIG_PATH = CLIENT_DIR / "config.local.json"
+
+# TG_CONFIG_DIR separates per-project config from the shared code.  When set,
+# config.local.json and .tg-bot-token live there instead of in CLIENT_DIR.
+# This lets a plugin-cached code copy serve multiple projects simultaneously.
+_config_dir_env = os.environ.get("TG_CONFIG_DIR")
+CONFIG_DIR: Path = Path(_config_dir_env).expanduser().resolve() if _config_dir_env else CLIENT_DIR
+
+LOCAL_CONFIG_PATH = CONFIG_DIR / "config.local.json"
 
 # Gitignored token-file fallback when the configured env var is unset.
-TOKEN_FILE = CLIENT_DIR / ".tg-bot-token"
+TOKEN_FILE = CONFIG_DIR / ".tg-bot-token"
 
 # Built-in fallbacks if neither config file supplies them.
 DEFAULT_TOKEN_ENV_VAR = "TG_BOT_TOKEN"
@@ -126,7 +133,7 @@ def _search_dotenv(var_name: str) -> Optional[str]:
         if tok:
             return tok
     seen = set()
-    for base in (CLIENT_DIR, *CLIENT_DIR.parents):
+    for base in (CONFIG_DIR, *CONFIG_DIR.parents):
         if base in seen:
             continue
         seen.add(base)

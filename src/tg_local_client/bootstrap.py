@@ -22,8 +22,9 @@ import sys
 import time
 from pathlib import Path
 
-from .config import (CLIENT_DIR, EXAMPLE_CONFIG_PATH, LOCAL_CONFIG_PATH,
-                     load_config, resolve_token, token_env_var)
+from .config import (CLIENT_DIR, CONFIG_DIR, EXAMPLE_CONFIG_PATH,
+                     LOCAL_CONFIG_PATH, load_config, resolve_token,
+                     token_env_var)
 
 CLAUDE_CONFIG_PATH = Path.home() / ".claude.json"
 
@@ -36,10 +37,13 @@ def build_mcp_entry(client_dir: Path, mcp_name: str, var_name: str) -> dict:
     an unsubstituted "${VAR}" reference — NOT written as a literal value — so the
     secret never lands in ~/.claude.json.
     """
+    env: dict = {var_name: "${" + var_name + "}"}
+    if CONFIG_DIR != CLIENT_DIR:
+        env["TG_CONFIG_DIR"] = str(CONFIG_DIR)
     return {
         "command": "uv",
         "args": ["run", "--directory", str(client_dir), "tg-local-mcp"],
-        "env": {var_name: "${" + var_name + "}"},
+        "env": env,
     }
 
 
