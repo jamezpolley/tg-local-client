@@ -547,11 +547,15 @@ async def send_document(
 
 @mcp.tool()
 def list_recent_messages(limit: int = 20, unread_only: bool = False,
-                         chat_id: Optional[int] = None) -> list[dict]:
+                         chat_id: Optional[int] = None,
+                         since_id: Optional[int] = None) -> list[dict]:
     """List recent inbound messages from the local store, newest-first.
 
     limit: max rows. unread_only: only messages with read_at IS NULL.
     chat_id: filter to a chat (defaults to all chats this client has seen).
+    since_id: only return messages with local DB id > since_id. Use the
+        highest id from the previous session's catch-up to avoid re-processing
+        already-handled messages on restart (idea-162).
 
     Each row includes reply_to_telegram_msg_id (non-null when the message is a
     threaded reply) and quote_text (non-null when the sender quote-replied,
@@ -565,6 +569,9 @@ def list_recent_messages(limit: int = 20, unread_only: bool = False,
     if chat_id is not None:
         where.append("chat_id = ?")
         params.append(chat_id)
+    if since_id is not None:
+        where.append("id > ?")
+        params.append(since_id)
     params.append(limit)
     conn = connect()
     try:
@@ -1074,6 +1081,27 @@ async def reopen_forum_topic(
         message_thread_id=message_thread_id,
     )
     return {"ok": bool(ok), "chat_id": chat_id, "message_thread_id": message_thread_id}
+
+
+# ---------------------------------------------------------------------------
+# Bot info
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_me() -> dict:
+    """Return this bot's own profile as reported by Telegram.
+
+    Useful for diagnosing group message visibility issues — the response
+    includes can_read_all_group_messages (False = privacy mode on; bot only
+    sees messages that @mention it directly) and can_join_groups.
+
+    Returns the full User object Telegram provides for bots: id, is_bot,
+    first_name, username, can_join_groups, can_read_all_group_messages,
+    supports_inline_queries, and any other fields Telegram includes.
+    """
+    bot = _require_bot()
+    me = await bot.get_me()
+    return me.to_dict()
 
 
 # ---------------------------------------------------------------------------
