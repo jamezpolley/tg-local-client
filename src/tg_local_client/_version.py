@@ -14,4 +14,4 @@ CLIENT_VERSION. Bumping it is how the `client_version` tool stays meaningful as
 a staleness signal.
 """
 
-CLIENT_VERSION = "2026-06-03.1"
+CLIENT_VERSION = "2026-06-03.2"

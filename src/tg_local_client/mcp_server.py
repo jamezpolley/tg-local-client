@@ -1101,7 +1101,15 @@ async def get_me() -> dict:
     """
     bot = _require_bot()
     me = await bot.get_me()
-    return me.to_dict()
+    return {
+        "id": me.id,
+        "is_bot": me.is_bot,
+        "first_name": me.first_name,
+        "username": me.username,
+        "can_join_groups": me.can_join_groups,
+        "can_read_all_group_messages": me.can_read_all_group_messages,
+        "supports_inline_queries": me.supports_inline_queries,
+    }
 
 
 # ---------------------------------------------------------------------------
