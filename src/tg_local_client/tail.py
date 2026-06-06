@@ -446,8 +446,13 @@ def _emit(line: str, *, has_filters: bool, from_username: Optional[str],
                 wake_on=wake_on,
                 mention_username=mention_username,
                 trusted_user_ids=trusted_user_ids):
-        # Deterministic layer passed; now the opt-in smart residue cut.
-        if _triage_passes(line, triage_config):
+        # Deterministic wake_on match → ACT immediately, skip Haiku.
+        # Non-wake_on traffic that reaches here goes through Haiku as normal.
+        wake_on_matched = wake_on and (
+            ("mention" in wake_on and _is_mention(record, mention_username)) or
+            ("trusted_humans" in wake_on and _is_trusted_human(record, trusted_user_ids))
+        )
+        if wake_on_matched or _triage_passes(line, triage_config):
             sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
             sys.stdout.flush()
         return True
