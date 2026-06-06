@@ -28,6 +28,7 @@ The actual subprocess invocation is isolated in `_invoke_claude` so tests can
 monkeypatch it — no live `claude` and no network in the test suite.
 """
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
