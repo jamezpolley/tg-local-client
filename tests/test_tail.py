@@ -302,7 +302,7 @@ def test_triage_filters_line_in_emit(capsys):
     cfg = triage.TriageConfig(role="test")
     original_should_act = triage.should_act
 
-    def _patched_should_act(message, config, invoke=None):
+    def _patched_should_act(message, config, invoke=None, sender=""):
         return False  # always SKIP
 
     import tg_local_client.tail as _tail
@@ -339,7 +339,7 @@ def test_triage_drops_empty_text_before_classifier(capsys):
     import tg_local_client.tail as _tail
     seen = []
 
-    def _always_act(message, config, invoke=None):
+    def _always_act(message, config, invoke=None, sender=""):
         seen.append(message)
         return True
 
@@ -366,7 +366,7 @@ def test_triage_passes_line_in_emit(capsys):
 
     import tg_local_client.tail as _tail
     original = _tail._triage_mod.should_act
-    _tail._triage_mod.should_act = lambda msg, config, invoke=None: True
+    _tail._triage_mod.should_act = lambda msg, config, invoke=None, sender="": True
     try:
         line = json.dumps({"text": "act on me", "from_username": "u"})
         _tail._emit(line, has_filters=False, from_username=None,
@@ -547,3 +547,193 @@ def test_tail_build_parser_cursor_file_arg(tmp_path):
     cursor_path = str(tmp_path / "cursor.json")
     args = tail.build_parser().parse_args(["/tmp/chan.jsonl", "--cursor-file", cursor_path])
     assert args.cursor_file == cursor_path
+
+
+# ---------------------------------------------------------------------------
+# New triage-routing tests: DM/@mention deterministic ACT, sender identity
+# ---------------------------------------------------------------------------
+
+def _make_skip_invoke():
+    """Returns a fake `should_act` that always SKIPs (plus a call-tracker)."""
+    calls = []
+
+    def _invoke(message, config, invoke=None, sender=""):
+        calls.append({"message": message, "sender": sender})
+        return False  # always SKIP
+
+    return _invoke, calls
+
+
+def _make_act_invoke():
+    """Returns a fake `should_act` that always ACTs (plus a call-tracker)."""
+    calls = []
+
+    def _invoke(message, config, invoke=None, sender=""):
+        calls.append({"message": message, "sender": sender})
+        return True  # always ACT
+
+    return _invoke, calls
+
+
+def test_dm_bypasses_triage_even_when_would_skip(capsys):
+    """DM (chat_id > 0) → deterministic ACT; Haiku is not consulted even if it
+    would return SKIP."""
+    cfg = triage.TriageConfig(role="test")
+    skip_invoke, calls = _make_skip_invoke()
+    import tg_local_client.tail as _tail
+    original = _tail._triage_mod.should_act
+    _tail._triage_mod.should_act = skip_invoke
+    try:
+        line = json.dumps({"text": "private dm", "from_user_id": 42,
+                           "from_username": "jaypoe", "chat_id": 42})  # positive = DM
+        _tail._emit(line, has_filters=False, from_username=None,
+                    message_thread_id=None, triage_config=cfg)
+        out = capsys.readouterr().out.strip()
+        assert out != ""  # emitted despite would-SKIP
+        assert json.loads(out)["text"] == "private dm"
+        assert calls == []  # Haiku was never consulted
+    finally:
+        _tail._triage_mod.should_act = original
+
+
+def test_mention_bypasses_triage_even_when_would_skip(capsys):
+    """Explicit @-mention → deterministic ACT; Haiku is not consulted."""
+    cfg = triage.TriageConfig(role="test")
+    skip_invoke, calls = _make_skip_invoke()
+    import tg_local_client.tail as _tail
+    original = _tail._triage_mod.should_act
+    _tail._triage_mod.should_act = skip_invoke
+    try:
+        line = json.dumps({"text": "hey @mybot do this", "from_user_id": 99,
+                           "chat_id": -100999})  # group (negative)
+        _tail._emit(line, has_filters=False, from_username=None,
+                    message_thread_id=None, triage_config=cfg,
+                    mention_username="mybot")
+        out = capsys.readouterr().out.strip()
+        assert out != ""  # emitted
+        assert "mybot" in json.loads(out)["text"]
+        assert calls == []  # no Haiku call
+    finally:
+        _tail._triage_mod.should_act = original
+
+
+def test_bot_to_bot_group_reaches_triager_act(capsys):
+    """Bot-to-bot group message (chat_id < 0, no mention, not a DM) reaches Haiku.
+    When Haiku ACTs, the record is emitted."""
+    cfg = triage.TriageConfig(role="test")
+    act_invoke, calls = _make_act_invoke()
+    import tg_local_client.tail as _tail
+    original = _tail._triage_mod.should_act
+    _tail._triage_mod.should_act = act_invoke
+    try:
+        line = json.dumps({"text": "bot reply", "from_user_id": 777,
+                           "from_username": "other_bot", "chat_id": -100999})
+        _tail._emit(line, has_filters=False, from_username=None,
+                    message_thread_id=None, triage_config=cfg)
+        out = capsys.readouterr().out.strip()
+        assert out != ""  # ACT → emitted
+        assert len(calls) == 1  # Haiku WAS consulted
+    finally:
+        _tail._triage_mod.should_act = original
+
+
+def test_bot_to_bot_group_reaches_triager_skip(capsys):
+    """Bot-to-bot group message: when Haiku SKIPs, the record is suppressed."""
+    cfg = triage.TriageConfig(role="test")
+    skip_invoke, calls = _make_skip_invoke()
+    import tg_local_client.tail as _tail
+    original = _tail._triage_mod.should_act
+    _tail._triage_mod.should_act = skip_invoke
+    try:
+        line = json.dumps({"text": "bot reply", "from_user_id": 777,
+                           "from_username": "other_bot", "chat_id": -100999})
+        _tail._emit(line, has_filters=False, from_username=None,
+                    message_thread_id=None, triage_config=cfg)
+        out = capsys.readouterr().out.strip()
+        assert out == ""  # SKIP → suppressed
+        assert len(calls) == 1  # Haiku WAS consulted (not hard-dropped)
+    finally:
+        _tail._triage_mod.should_act = original
+
+
+def test_trusted_human_in_group_goes_to_triager_not_auto_act(capsys):
+    """A trusted human posting in a group without @-mention → routed to Haiku,
+    NOT auto-ACT'd. The intelligence lives in the triager, not a blunt hard-ACT."""
+    cfg = triage.TriageConfig(role="test")
+    skip_invoke, calls = _make_skip_invoke()
+    import tg_local_client.tail as _tail
+    original = _tail._triage_mod.should_act
+    _tail._triage_mod.should_act = skip_invoke
+    try:
+        line = json.dumps({"text": "group message from james", "from_user_id": 42,
+                           "from_username": "jaypoe", "chat_id": -100999})
+        # wake_on trusted_humans is the coarse PRE-filter (must pass _matches), but
+        # after that it should NOT short-circuit to ACT.
+        _tail._emit(line, has_filters=True, from_username=None,
+                    message_thread_id=None, triage_config=cfg,
+                    wake_on=["trusted_humans"], trusted_user_ids=[42])
+        out = capsys.readouterr().out.strip()
+        # Haiku said SKIP → not emitted
+        assert out == ""
+        # But Haiku WAS consulted (not auto-ACT'd, not hard-dropped)
+        assert len(calls) == 1
+    finally:
+        _tail._triage_mod.should_act = original
+
+
+def test_sender_label_with_username():
+    assert tail._sender_label({"from_username": "jaypoe", "from_user_id": 174969502}) \
+        == "@jaypoe (id=174969502)"
+
+
+def test_sender_label_name_only():
+    assert tail._sender_label({"from_first_name": "James", "from_user_id": 42}) \
+        == "James (id=42)"
+
+
+def test_sender_label_id_only():
+    assert tail._sender_label({"from_user_id": 99}) == "id=99"
+
+
+def test_sender_label_empty():
+    assert tail._sender_label({}) == ""
+
+
+def test_build_prompt_contains_sender():
+    """build_prompt injects SENDER: line when sender is provided."""
+    prompt = triage.build_prompt("my role", "waiting on stuff", "hello there",
+                                 sender="@jaypoe (id=1)")
+    assert "SENDER: @jaypoe (id=1)" in prompt
+
+
+def test_build_prompt_no_sender_line_when_empty():
+    """build_prompt omits the SENDER: line entirely when sender is empty."""
+    prompt = triage.build_prompt("my role", "waiting on stuff", "hello there", sender="")
+    assert "SENDER:" not in prompt
+
+
+def test_should_act_passes_sender_to_prompt():
+    """should_act passes sender through to build_prompt; the fake invoke sees it in
+    the prompt string."""
+    cfg = triage.TriageConfig(role="test")
+    captured_prompts = []
+
+    def _capture_invoke(prompt, model, timeout):
+        captured_prompts.append(prompt)
+        return "ACT"
+
+    triage.should_act("hi", cfg, invoke=_capture_invoke, sender="@jaypoe (id=1)")
+    assert len(captured_prompts) == 1
+    assert "SENDER: @jaypoe (id=1)" in captured_prompts[0]
+
+
+def test_is_dm_positive_chat_id():
+    assert tail._is_dm({"chat_id": 174969502}) is True
+
+
+def test_is_dm_negative_chat_id():
+    assert tail._is_dm({"chat_id": -100999}) is False
+
+
+def test_is_dm_zero_chat_id():
+    assert tail._is_dm({"chat_id": 0}) is False
