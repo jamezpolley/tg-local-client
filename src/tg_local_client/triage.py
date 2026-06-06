@@ -113,6 +113,8 @@ def _invoke_claude(prompt: str, model: str, timeout: int) -> str:
 
     Raises on subprocess failure/timeout; the caller treats any raise as ACT.
     """
+    clean_env = {k: v for k, v in os.environ.items()
+                 if not k.startswith("CLAUDE_") and k != "CLAUDECODE"}
     proc = subprocess.run(
         [
             "claude",
@@ -126,6 +128,9 @@ def _invoke_claude(prompt: str, model: str, timeout: int) -> str:
         capture_output=True,
         text=True,
         timeout=timeout,
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        env=clean_env,
     )
     return proc.stdout or ""
 
