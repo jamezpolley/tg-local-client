@@ -383,13 +383,17 @@ def _matches(record: dict, *, from_username: Optional[str],
     return True
 
 
-def _triage_passes(line: str, triage_config) -> bool:
-    """Run the OPT-IN Haiku ACT/SKIP layer on a line that already survived the
+def _triage_passes(line: str, triage_config, record: Optional[dict] = None) -> bool:
+    """Run the Haiku ACT/SKIP layer on a line that already survived the
     deterministic filters. True = emit (ACT), False = suppress (SKIP).
 
     No triage_config → always pass (layer is off, behaviour unchanged). The
     classifier itself is fail-safe (any error/malformed output → ACT), so this
     can only ever ADD suppression on top of the deterministic cut, never widen it.
+
+    `record` (when supplied) is used to inject the sender's identity into the
+    Haiku prompt, so the classifier can reason about WHO sent the message (e.g.
+    apply an "always ACT on James" rule). Without it, Haiku only sees the text.
     """
     if triage_config is None:
         return True
@@ -400,7 +404,59 @@ def _triage_passes(line: str, triage_config) -> bool:
     # otherwise every such record would wake the agent.
     if not message:
         return False
-    return _triage_mod.should_act(message, triage_config)
+    sender = _sender_label(record) if isinstance(record, dict) else ""
+    return _triage_mod.should_act(message, triage_config, sender=sender)
+
+
+def _sender_label(record: dict) -> str:
+    """Human-readable sender identity for the triage prompt.
+
+    e.g. "@jaypoe (id=174969502)", or "Jammmmm (id=174969502)" when no username,
+    or "id=174969502" as a last resort. Empty string if nothing is known.
+    """
+    if not isinstance(record, dict):
+        return ""
+    uname = record.get("from_username")
+    uid = record.get("from_user_id")
+    name = record.get("from_first_name")
+    suffix = f" (id={uid})" if uid else ""
+    if uname:
+        return f"@{uname}{suffix}"
+    if name:
+        return f"{name}{suffix}"
+    return f"id={uid}" if uid else ""
+
+
+def _is_dm(record: dict) -> bool:
+    """True if the record is from a private chat (a DM).
+
+    Telegram private-chat ids ARE the (positive) user id; basic groups,
+    supergroups and channels are all NEGATIVE. So a positive chat_id is
+    unambiguously a DM. A DM is ALWAYS for this agent regardless of sender —
+    this is coded explicitly rather than inferred from trusted-human matching.
+    """
+    return (record.get("chat_id") or 0) > 0
+
+
+def _relevance_emit(record: dict, line: str, *,
+                    mention_username: Optional[str], triage_config) -> None:
+    """Decide ACT/SKIP for a record that survived the coarse deterministic
+    filters, and emit it (compact JSON) on ACT.
+
+    Deterministic ACT (Haiku skipped): a DM, or an explicit @-mention —
+    unambiguously for this agent. Everything else — including bot-to-bot chatter
+    AND trusted humans posting in a group without an @-mention — goes to the
+    Haiku triager WITH sender identity, so relevance is judged (and sender rules
+    like "always ACT on James" can fire) rather than the message being
+    hard-dropped. No triage_config → the residue passes through unchanged.
+    """
+    if _is_dm(record) or _is_mention(record, mention_username):
+        sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        return
+    if _triage_passes(line, triage_config, record=record):
+        sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
 
 
 def _emit(line: str, *, has_filters: bool, from_username: Optional[str],
@@ -428,8 +484,16 @@ def _emit(line: str, *, has_filters: bool, from_username: Optional[str],
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
             return True
-        # Triage-only mode: classify, emit verbatim if ACT.
-        if _triage_passes(line, triage_config):
+        # Triage-only mode: still honour the DM / @-mention deterministic ACT,
+        # then send the residue (incl. bot-to-bot) to Haiku with sender identity.
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            record = None
+        if isinstance(record, dict):
+            _relevance_emit(record, line, mention_username=mention_username,
+                            triage_config=triage_config)
+        elif _triage_passes(line, triage_config):
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
         return True
@@ -446,15 +510,14 @@ def _emit(line: str, *, has_filters: bool, from_username: Optional[str],
                 wake_on=wake_on,
                 mention_username=mention_username,
                 trusted_user_ids=trusted_user_ids):
-        # Deterministic wake_on match → ACT immediately, skip Haiku.
-        # Non-wake_on traffic that reaches here goes through Haiku as normal.
-        wake_on_matched = wake_on and (
-            ("mention" in wake_on and _is_mention(record, mention_username)) or
-            ("trusted_humans" in wake_on and _is_trusted_human(record, trusted_user_ids))
-        )
-        if wake_on_matched or _triage_passes(line, triage_config):
-            sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
-            sys.stdout.flush()
+        # Relevance decision: DM / @-mention → deterministic ACT (skip Haiku);
+        # everything else (incl. bot-to-bot) → Haiku with sender identity.
+        # NOTE: `wake_on` (if set) is only the OPT-IN coarse pre-filter in
+        # _matches; it no longer short-circuits to ACT here, and a trusted human
+        # posting in a group without an @-mention is deliberately routed to Haiku
+        # (not auto-ACK'd) — DMs are the explicit "always ACT" path.
+        _relevance_emit(record, line, mention_username=mention_username,
+                        triage_config=triage_config)
         return True
     # Filtered out by deterministic layer; advance cursor anyway.
     return True
