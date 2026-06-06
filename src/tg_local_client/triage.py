@@ -82,19 +82,20 @@ def _read_state(state_file: Optional[Path]) -> str:
     return text or "(waiting-on state file is empty)"
 
 
-def build_prompt(role: str, waiting_on: str, message: str) -> str:
+def build_prompt(role: str, waiting_on: str, message: str, sender: str = "") -> str:
     """Compose the ACT/SKIP prompt: agent identity + waiting-on state + candidate.
 
     The prompt is deliberately explicit that a false SKIP is the only costly
     error, so the model errs toward ACT when uncertain.
     """
+    sender_line = f"SENDER: {sender}\n" if sender else ""
     return (
         "You are a relevance gate for an autonomous agent. Decide whether the "
         "agent must ACT on one incoming chat message, or can SKIP it.\n\n"
         f"AGENT ROLE / IDENTITY:\n{role}\n\n"
         f"AGENT'S CURRENT WAITING-ON STATE (what it is blocked on or expecting):\n"
         f"{waiting_on}\n\n"
-        f"INCOMING MESSAGE:\n{message}\n\n"
+        f"INCOMING MESSAGE:\n{sender_line}{message}\n\n"
         "Answer with exactly one word: ACT or SKIP.\n"
         "- ACT  = the agent needs to see or do something about this message.\n"
         "- SKIP = the message does not concern the agent at all.\n"
@@ -156,15 +157,18 @@ def _parse_decision(raw: str) -> bool:
 
 
 def should_act(message: str, config: TriageConfig,
-               invoke: Optional[Callable[[str, str, int], str]] = None) -> bool:
+               invoke: Optional[Callable[[str, str, int], str]] = None,
+               sender: str = "") -> bool:
     """Return True if the agent must ACT on `message` (emit it), False to SKIP.
 
     `invoke` lets tests inject a fake `claude -p`; defaults to `_invoke_claude`.
+    `sender` is an optional human-readable sender identity (e.g. "@username") to
+    include in the prompt so Haiku can reason about who sent the message.
     Any exception from the invocation is caught and treated as ACT (fail-safe).
     """
     invoke = invoke or _invoke_claude
     waiting_on = _read_state(config.state_file)
-    prompt = build_prompt(config.role, waiting_on, message)
+    prompt = build_prompt(config.role, waiting_on, message, sender=sender)
     try:
         raw = invoke(prompt, config.model, config.timeout)
     except Exception:

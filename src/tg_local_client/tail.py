@@ -383,13 +383,14 @@ def _matches(record: dict, *, from_username: Optional[str],
     return True
 
 
-def _triage_passes(line: str, triage_config) -> bool:
-    """Run the OPT-IN Haiku ACT/SKIP layer on a line that already survived the
+def _triage_passes(line: str, triage_config, sender: str = "") -> bool:
+    """Run the Haiku ACT/SKIP layer on a line that already survived the
     deterministic filters. True = emit (ACT), False = suppress (SKIP).
 
     No triage_config → always pass (layer is off, behaviour unchanged). The
     classifier itself is fail-safe (any error/malformed output → ACT), so this
     can only ever ADD suppression on top of the deterministic cut, never widen it.
+    sender is injected into the Haiku prompt so it can reason about who sent it.
     """
     if triage_config is None:
         return True
@@ -400,7 +401,7 @@ def _triage_passes(line: str, triage_config) -> bool:
     # otherwise every such record would wake the agent.
     if not message:
         return False
-    return _triage_mod.should_act(message, triage_config)
+    return _triage_mod.should_act(message, triage_config, sender=sender)
 
 
 def _emit(line: str, *, has_filters: bool, from_username: Optional[str],
@@ -446,13 +447,20 @@ def _emit(line: str, *, has_filters: bool, from_username: Optional[str],
                 wake_on=wake_on,
                 mention_username=mention_username,
                 trusted_user_ids=trusted_user_ids):
-        # Deterministic wake_on match → ACT immediately, skip Haiku.
-        # Non-wake_on traffic that reaches here goes through Haiku as normal.
-        wake_on_matched = wake_on and (
-            ("mention" in wake_on and _is_mention(record, mention_username)) or
-            ("trusted_humans" in wake_on and _is_trusted_human(record, trusted_user_ids))
-        )
-        if wake_on_matched or _triage_passes(line, triage_config):
+        # Deterministic ACT: DM (positive chat_id = private chat) or explicit
+        # @mention. These are unambiguous — no need to consult Haiku.
+        is_dm = (record.get("chat_id") or 0) > 0
+        is_mention = _is_mention(record, mention_username)
+        if is_dm or is_mention:
+            sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+            return True
+        # Everything else (e.g. trusted human posting in a group without @mention)
+        # goes to Haiku with sender identity so it can make an informed decision.
+        sender = record.get("from_username") or record.get("from_first_name") or ""
+        if sender:
+            sender = f"@{sender}" if record.get("from_username") else sender
+        if _triage_passes(line, triage_config, sender=sender):
             sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
             sys.stdout.flush()
         return True
